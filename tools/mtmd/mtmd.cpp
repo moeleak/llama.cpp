@@ -393,6 +393,12 @@ struct mtmd_context {
         projector_type proj = clip_get_projector_type(ctx_v);
 
         switch (proj) {
+            case PROJECTOR_TYPE_LLADAO:
+                {
+                    img_beg = "<|vision_start|>";
+                    img_end = "<|vision_end|>";
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_lladao>(ctx_v);
+                } break;
             case PROJECTOR_TYPE_MLP:
             case PROJECTOR_TYPE_MLP_NORM:
             case PROJECTOR_TYPE_LDP:
@@ -1687,6 +1693,7 @@ bool mtmd_decode_use_non_causal(const mtmd_context * ctx, const mtmd_input_chunk
         proj_type = ctx->proj_type_a();
     }
     switch (proj_type) {
+        case PROJECTOR_TYPE_LLADAO:
         case PROJECTOR_TYPE_GEMMA3:
         case PROJECTOR_TYPE_GEMMA4V:
         case PROJECTOR_TYPE_GEMMA4UV:

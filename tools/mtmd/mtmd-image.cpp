@@ -909,6 +909,68 @@ mtmd_image_preproc_out mtmd_image_preprocessor_dyn_size::preprocess(const clip_i
     return output;
 }
 
+clip_image_size mtmd_lladao_image_size(const clip_image_size & input_size) {
+    constexpr int image_max_edge   = 980;
+    constexpr int image_min_edge   = 378;
+    constexpr int image_stride     = 14;
+    constexpr int image_max_pixels = 2007040;
+
+    GGML_ASSERT(input_size.width > 0 && input_size.height > 0);
+
+    auto apply_scale = [image_stride](int width, int height, double scale) {
+        const int scaled_width  = static_cast<int>(std::nearbyint(width * scale));
+        const int scaled_height = static_cast<int>(std::nearbyint(height * scale));
+        return clip_image_size{
+            std::max(image_stride,
+                     static_cast<int>(std::nearbyint(static_cast<double>(scaled_width) / image_stride)) * image_stride),
+            std::max(image_stride, static_cast<int>(std::nearbyint(static_cast<double>(scaled_height) / image_stride)) *
+                                       image_stride),
+        };
+    };
+
+    double scale = std::min(static_cast<double>(image_max_edge) / std::max(input_size.width, input_size.height), 1.0);
+    scale        = std::max(scale, static_cast<double>(image_min_edge) / std::min(input_size.width, input_size.height));
+
+    clip_image_size output_size = apply_scale(input_size.width, input_size.height, scale);
+
+    if (static_cast<int64_t>(output_size.width) * output_size.height > image_max_pixels) {
+        scale = static_cast<double>(image_max_pixels) / (static_cast<int64_t>(output_size.width) * output_size.height);
+        output_size = apply_scale(output_size.width, output_size.height, scale);
+    }
+
+    if (std::max(output_size.width, output_size.height) > image_max_edge) {
+        scale       = static_cast<double>(image_max_edge) / std::max(output_size.width, output_size.height);
+        output_size = apply_scale(output_size.width, output_size.height, scale);
+    }
+
+    return output_size;
+}
+
+std::vector<int32_t> mtmd_lladao_position_ids(int patch_rows, int patch_cols) {
+    constexpr int bucket_side = 70;
+
+    GGML_ASSERT(patch_rows > 0 && patch_cols > 0);
+
+    std::vector<int32_t> positions(patch_rows * patch_cols);
+    for (int row = 0; row < patch_rows; row++) {
+        const int bucket_row = bucket_side * row / patch_rows;
+        for (int col = 0; col < patch_cols; col++) {
+            const int bucket_col              = bucket_side * col / patch_cols;
+            positions[row * patch_cols + col] = bucket_row * bucket_side + bucket_col;
+        }
+    }
+    return positions;
+}
+
+mtmd_image_preproc_out mtmd_image_preprocessor_lladao::preprocess(const clip_image_u8 & img) {
+    clip_image_u8 resized_image;
+    img_tool::resize(img, resized_image, mtmd_lladao_image_size(img.get_size()), RESIZE_ALGO_BICUBIC_PILLOW, PAD_NONE);
+
+    mtmd_image_preproc_out output;
+    output.append(hparams, resized_image, true);
+    return output;
+}
+
 //
 // mtmd_image_preprocessor_longest_edge
 //

@@ -116,6 +116,13 @@ if (TARGET BUILD_INFO)
     add_dependencies(mtmd-helper BUILD_INFO)
 endif()
 
+if (LLAMA_BUILD_TESTS)
+    add_executable(test-mtmd-lladao tests/test-lladao.cpp)
+    target_link_libraries(test-mtmd-lladao PRIVATE mtmd)
+    target_compile_features(test-mtmd-lladao PRIVATE cxx_std_17)
+    add_test(NAME test-mtmd-lladao COMMAND test-mtmd-lladao)
+endif()
+
 # if mtmd is linked against llama-common, we throw an error
 if (TARGET mtmd)
     get_target_property(libs mtmd LINK_LIBRARIES)

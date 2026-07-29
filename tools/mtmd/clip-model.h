@@ -405,6 +405,7 @@ struct clip_model {
     ggml_tensor * mm_ffn_down_b = nullptr;
     ggml_tensor * mm_post_norm_w = nullptr;
     ggml_tensor * mm_post_norm_b = nullptr;
+    ggml_tensor * mm_position_embeddings = nullptr;
 
     // LLaVA projection
     ggml_tensor * mm_input_norm_w = nullptr;

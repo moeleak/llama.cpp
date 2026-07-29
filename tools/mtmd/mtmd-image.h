@@ -26,6 +26,9 @@ struct mtmd_image_preproc_out {
     }
 };
 
+clip_image_size mtmd_lladao_image_size(const clip_image_size & input_size);
+std::vector<int32_t> mtmd_lladao_position_ids(int patch_rows, int patch_cols);
+
 // base class, models must inherit from this class
 struct mtmd_image_preprocessor {
     const clip_hparams & hparams;
@@ -120,6 +123,11 @@ struct mtmd_image_preprocessor_fixed_size : mtmd_image_preprocessor {
 // this is used by models with native support for dynamic image size, for example: Qwen-VL, Pixtral, Kimi-VL, etc
 struct mtmd_image_preprocessor_dyn_size : mtmd_image_preprocessor {
     mtmd_image_preprocessor_dyn_size(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
+    mtmd_image_preproc_out preprocess(const clip_image_u8 & img) override;
+};
+
+struct mtmd_image_preprocessor_lladao : mtmd_image_preprocessor {
+    mtmd_image_preprocessor_lladao(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
     mtmd_image_preproc_out preprocess(const clip_image_u8 & img) override;
 };
 

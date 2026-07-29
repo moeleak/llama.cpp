@@ -777,6 +777,9 @@ struct llm_graph_params {
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
+            cparams.d2f_image_prefix_length == other.cparams.d2f_image_prefix_length &&
+            cparams.d2f_prefix_length       == other.cparams.d2f_prefix_length       &&
+            cparams.d2f_block_size          == other.cparams.d2f_block_size          &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&

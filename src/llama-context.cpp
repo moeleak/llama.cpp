@@ -1185,6 +1185,33 @@ void llama_context::set_causal_attn(bool value) {
     sched_need_reserve = true;
 }
 
+void llama_context::set_d2f_attention(
+        int32_t image_prefix_length,
+        int32_t prefix_length,
+        int32_t block_size) {
+    if (image_prefix_length < 0 ||
+        prefix_length < image_prefix_length ||
+        block_size <= 0) {
+        image_prefix_length = -1;
+        prefix_length = -1;
+        block_size = 0;
+    }
+
+    LLAMA_LOG_DEBUG("%s: image_prefix_length = %d, prefix_length = %d, block_size = %d\n",
+            __func__, image_prefix_length, prefix_length, block_size);
+
+    if (cparams.d2f_image_prefix_length == image_prefix_length &&
+        cparams.d2f_prefix_length == prefix_length &&
+        cparams.d2f_block_size == block_size) {
+        return;
+    }
+
+    cparams.d2f_image_prefix_length = image_prefix_length;
+    cparams.d2f_prefix_length = prefix_length;
+    cparams.d2f_block_size = block_size;
+    sched_need_reserve = true;
+}
+
 void llama_context::set_warmup(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -3667,6 +3694,14 @@ void llama_set_embeddings(llama_context * ctx, bool embeddings) {
 
 void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
     ctx->set_causal_attn(causal_attn);
+}
+
+void llama_set_d2f_attention(
+        llama_context * ctx,
+        int32_t image_prefix_length,
+        int32_t prefix_length,
+        int32_t block_size) {
+    ctx->set_d2f_attention(image_prefix_length, prefix_length, block_size);
 }
 
 void llama_set_warmup(llama_context * ctx, bool warmup) {

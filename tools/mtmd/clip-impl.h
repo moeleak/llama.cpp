@@ -127,6 +127,7 @@
 #define TN_MM_GATE         "mm.gate.%s"
 #define TN_MM_DOWN         "mm.down.%s"
 #define TN_MM_POST_NORM    "mm.post_norm.%s"
+#define TN_MM_POS_EMBD     "mm.position_embd"
 #define TN_MVLM_PROJ_MLP   "mm.model.mlp.%d.%s"
 #define TN_MVLM_PROJ_BLOCK "mm.model.mb_block.%d.block.%d.%s"
 #define TN_MVLM_PROJ_PEG   "mm.model.peg.%d.%s"
@@ -407,6 +408,7 @@ enum projector_type {
     PROJECTOR_TYPE_MINIMAX_M3,
     PROJECTOR_TYPE_GRANITE4_VISION,
     PROJECTOR_TYPE_MIMO_AUDIO,
+    PROJECTOR_TYPE_LLADAO,
     PROJECTOR_TYPE_UNKNOWN,
 };
 
@@ -464,6 +466,7 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_GRANITE4_VISION,   "granite4_vision"},
     { PROJECTOR_TYPE_MIMO_AUDIO,        "mimo_audio"},
     { PROJECTOR_TYPE_PARAKEET,          "parakeet"},
+    { PROJECTOR_TYPE_LLADAO,            "lladao"},
 };
 
 static projector_type clip_projector_type_from_string(const std::string & str) {

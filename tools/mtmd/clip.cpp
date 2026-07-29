@@ -2,6 +2,7 @@
 #include "clip-impl.h"
 #include "clip-model.h"
 #include "clip-graph.h"
+#include "mtmd-image.h"
 #include "models/models.h"
 
 #include "ggml.h"
@@ -878,6 +879,10 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
     std::unique_ptr<clip_graph> builder;
 
     switch (ctx->proj_type()) {
+        case PROJECTOR_TYPE_LLADAO:
+            {
+                builder = std::make_unique<clip_graph_lladao>(ctx, img);
+            } break;
         case PROJECTOR_TYPE_GEMMA3:
         case PROJECTOR_TYPE_IDEFICS3:
         case PROJECTOR_TYPE_LFM2:
@@ -1577,6 +1582,14 @@ struct clip_model_loader {
                         hparams.set_limit_image_tokens(8, 4096);
                         hparams.set_warmup_n_tokens(46*46); // avoid OOM on warmup
                     } break;
+                case PROJECTOR_TYPE_LLADAO:
+                    {
+                        hparams.ffn_op = FFN_GELU;
+                        log_ffn_op = "gelu";
+                        hparams.image_resize_algo = RESIZE_ALGO_BICUBIC_PILLOW;
+                        hparams.image_resize_pad = PAD_NONE;
+                        hparams.warmup_image_size = 378;
+                    } break;
                 case PROJECTOR_TYPE_LLAMA4:
                     {
                         hparams.rope_theta = 10000.0f;
@@ -2057,6 +2070,14 @@ struct clip_model_loader {
 
 
         switch (model.proj_type) {
+            case PROJECTOR_TYPE_LLADAO:
+                {
+                    model.mm_0_w = get_tensor(string_format(TN_LLAVA_PROJ, 0, "weight"));
+                    model.mm_0_b = get_tensor(string_format(TN_LLAVA_PROJ, 0, "bias"));
+                    model.mm_2_w = get_tensor(string_format(TN_LLAVA_PROJ, 2, "weight"));
+                    model.mm_2_b = get_tensor(string_format(TN_LLAVA_PROJ, 2, "bias"));
+                    model.mm_position_embeddings = get_tensor(TN_MM_POS_EMBD);
+                } break;
             case PROJECTOR_TYPE_MLP:
             case PROJECTOR_TYPE_MLP_NORM:
                 {
@@ -3541,6 +3562,7 @@ int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img) {
     projector_type proj = ctx->proj_type();
 
     switch (proj) {
+        case PROJECTOR_TYPE_LLADAO:
         case PROJECTOR_TYPE_MLP:
         case PROJECTOR_TYPE_MLP_NORM:
         case PROJECTOR_TYPE_JANUS_PRO:
@@ -3927,6 +3949,11 @@ bool clip_image_batch_encode(clip_ctx * ctx, int n_threads, const clip_image_f32
 
     // set input per projector
     switch (ctx->model.proj_type) {
+        case PROJECTOR_TYPE_LLADAO:
+            {
+                std::vector<int32_t> positions = mtmd_lladao_position_ids(pos_h, pos_w);
+                set_input_i32("positions", positions);
+            } break;
         case PROJECTOR_TYPE_MINICPMV:
             {
                 // inspired from siglip:
@@ -4955,6 +4982,8 @@ bool clip_image_batch_encode(clip_ctx * ctx, int n_threads, const clip_image_f32
 
 int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
     switch (ctx->model.proj_type) {
+        case PROJECTOR_TYPE_LLADAO:
+            return ctx->model.mm_2_w->ne[1];
         case PROJECTOR_TYPE_LDP:
             return ctx->model.mm_model_block_1_block_2_1_b->ne[0];
         case PROJECTOR_TYPE_LDPV2:

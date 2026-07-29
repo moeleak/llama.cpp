@@ -411,6 +411,14 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
         using T = std::remove_reference_t<decltype(*data)>;
         std::fill(data, data + ne, llama_cast<T>(-INFINITY));
 
+        const bool use_d2f_mask =
+            cparams.d2f_image_prefix_length >= 0 &&
+            cparams.d2f_prefix_length >= 0 &&
+            cparams.d2f_block_size > 0;
+        GGML_ASSERT(!use_d2f_mask ||
+            (cparams.d2f_image_prefix_length <= cparams.d2f_prefix_length &&
+             cparams.d2f_prefix_length <= n_tokens));
+
         for (int i1 = 0; i1 < n_tokens; ++i1) {
             const llama_seq_id s1 = ubatch->seq_id[i1][0];
             const llama_pos    p1 = ubatch->pos[i1];
@@ -426,8 +434,32 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
                     continue;
                 }
 
-                // mask future tokens
-                if (cparams.causal_attn && p0 > p1) {
+                if (use_d2f_mask) {
+                    const int32_t image_prefix_length = cparams.d2f_image_prefix_length;
+                    const int32_t prefix_length = cparams.d2f_prefix_length;
+                    const int32_t block_size = cparams.d2f_block_size;
+
+                    bool visible = false;
+                    if (i1 < image_prefix_length) {
+                        // Image queries see the image split, but never the
+                        // following question/instruction text.
+                        visible = i0 < image_prefix_length;
+                    } else if (i1 < prefix_length) {
+                        // Text queries see both complete prefix splits.
+                        visible = i0 < prefix_length;
+                    } else if (i0 < prefix_length) {
+                        visible = true;
+                    } else {
+                        const int32_t query_block = (i1 - prefix_length) / block_size;
+                        const int32_t key_block = (i0 - prefix_length) / block_size;
+                        visible = key_block <= query_block;
+                    }
+
+                    if (!visible) {
+                        continue;
+                    }
+                } else if (cparams.causal_attn && p0 > p1) {
+                    // mask future tokens
                     continue;
                 }
 

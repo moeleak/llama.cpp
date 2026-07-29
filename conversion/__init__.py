@@ -19,6 +19,7 @@ __all__ = [
 TEXT_MODEL_MAP: dict[str, str] = {
     "AfmoeForCausalLM": "afmoe",
     "LagunaForCausalLM": "laguna",
+    "LLaDAOGuiForDiffusionLM": "llada",
     "ApertusForCausalLM": "llama",
     "ArceeForCausalLM": "llama",
     "ArcticForCausalLM": "arctic",
@@ -286,6 +287,7 @@ MMPROJ_MODEL_MAP: dict[str, str] = {
     "Lfm2AudioForConditionalGeneration": "lfm2",
     "Lfm2VlForConditionalGeneration": "lfm2",
     "LightOnOCRForConditionalGeneration": "lighton_ocr",
+    "LLaDAOGuiForDiffusionLM": "lladao_vision",
     "Llama4ForConditionalGeneration": "llama4",
     "LlavaForConditionalGeneration": "llava",
     "MERaLiON2ForConditionalGeneration": "ultravox",

@@ -1774,6 +1774,10 @@ class TensorNameMap:
             "vit.perceive.after_rms", # HunyuanVL
         ),
 
+        MODEL_TENSOR.V_MM_POS_EMBD: (
+            "vit_pos_embed.pos_embed", # LLaDA-o
+        ),
+
         MODEL_TENSOR.V_MM_INP_PROJ: (
             "multi_modal_projector.mm_input_projection",
         ),

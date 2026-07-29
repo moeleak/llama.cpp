@@ -1,5 +1,5 @@
 set(TARGET llama-diffusion)
-add_library(${TARGET} STATIC diffusion.cpp diffusion.h)
+add_library(${TARGET} STATIC diffusion.cpp diffusion.h d2f-scheduler.cpp d2f-scheduler.h)
 target_link_libraries(${TARGET} PUBLIC llama llama-common ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${TARGET} PUBLIC cxx_std_17)
 
@@ -8,3 +8,11 @@ add_executable(${TARGET} diffusion-cli.cpp)
 install(TARGETS ${TARGET} RUNTIME)
 target_link_libraries(${TARGET} PRIVATE llama-diffusion llama llama-common ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+if (LLAMA_BUILD_TESTS)
+    set(TEST_TARGET test-diffusion-d2f-scheduler)
+    add_executable(${TEST_TARGET} test-d2f-scheduler.cpp)
+    target_link_libraries(${TEST_TARGET} PRIVATE llama-diffusion)
+    target_compile_features(${TEST_TARGET} PRIVATE cxx_std_17)
+    add_test(NAME ${TEST_TARGET} COMMAND ${TEST_TARGET})
+endif()

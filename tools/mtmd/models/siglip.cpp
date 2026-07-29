@@ -1,5 +1,38 @@
 #include "models.h"
 
+ggml_cgraph * clip_graph_lladao::build() {
+    GGML_ASSERT(model.position_embeddings);
+    GGML_ASSERT(model.mm_position_embeddings);
+
+    ggml_tensor * positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_patches);
+    ggml_set_name(positions, "positions");
+    ggml_set_input(positions);
+
+    ggml_tensor * learned_pos_embd = ggml_get_rows(ctx0, model.position_embeddings, positions);
+
+    ggml_tensor * cur = build_vit(
+                            build_inp(), n_patches,
+                            NORM_TYPE_NORMAL,
+                            FFN_GELU,
+                            learned_pos_embd,
+                            nullptr);
+
+    cur = build_ffn(cur,
+        model.mm_0_w, model.mm_0_b,
+        nullptr, nullptr,
+        model.mm_2_w, model.mm_2_b,
+        FFN_GELU,
+        -1);
+    cb(cur, "connector", -1);
+
+    ggml_tensor * mm_pos_embd = ggml_get_rows(ctx0, model.mm_position_embeddings, positions);
+    cur = ggml_add(ctx0, cur, mm_pos_embd);
+    cb(cur, "mm_pos_embed", -1);
+
+    ggml_build_forward_expand(gf, cur);
+    return gf;
+}
+
 ggml_cgraph * clip_graph_siglip::build() {
     ggml_tensor * inp = build_inp();
 

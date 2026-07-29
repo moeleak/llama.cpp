@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Iterable, TYPE_CHECKING
+from typing import Callable, Iterable, TYPE_CHECKING
 
 import torch
 
@@ -10,10 +10,19 @@ if TYPE_CHECKING:
 from .base import ModelBase, TextModel, gguf
 
 
-@ModelBase.register("LLaDAModelLM")
+@ModelBase.register("LLaDAModelLM", "LLaDAOGuiForDiffusionLM")
 class LLaDAModel(TextModel):
     model_arch = gguf.MODEL_ARCH.LLADA
     undo_permute = True
+
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        name, _ = item
+
+        if "_moe_gen" in name or ".lora_A" in name or ".lora_B" in name:
+            return None
+
+        return super().filter_tensors(item)
 
     def get_vocab_base(self) -> tuple[list[str], list[int], str]:
         tokens: list[str] = []
@@ -50,45 +59,60 @@ class LLaDAModel(TextModel):
                 tokens.append(reverse_vocab[i])
                 toktypes.append(gguf.TokenType.NORMAL)
 
+        if self.hf_arch == "LLaDAOGuiForDiffusionLM":
+            # LLaDA-o adds these two tokens dynamically before resizing the
+            # embedding table. The exported tokenizer files predate that
+            # runtime mutation, so restore the exact reserved IDs here.
+            for token_id, token in ((126349, "<|vision_start|>"), (126350, "<|vision_end|>")):
+                if token_id >= vocab_size:
+                    raise ValueError(f"LLaDA-o vocabulary is too small for {token}: {vocab_size}")
+                tokens[token_id] = token
+                toktypes[token_id] = gguf.TokenType.CONTROL
+
         return tokens, toktypes, tokpre
 
     def set_vocab(self):
         self._set_vocab_gpt2()
 
-        # LLaDA specific parameters
-        self.gguf_writer.add_add_bos_token(True)
+        # Legacy LLaDA checkpoints expect automatic BOS insertion. LLaDA-o
+        # builds its multimodal sequence explicitly, so preserve the tokenizer
+        # metadata and let the D2F runner insert BOS exactly once.
+        if self.hf_arch != "LLaDAOGuiForDiffusionLM":
+            self.gguf_writer.add_add_bos_token(True)
 
     def set_gguf_parameters(self):
+        hparams = self.hparams
+        if "hidden_size" not in hparams and "d_model" in hparams:
+            hparams["hidden_size"] = hparams["d_model"]
+        if "intermediate_size" not in hparams and "mlp_hidden_size" in hparams:
+            hparams["intermediate_size"] = hparams["mlp_hidden_size"]
+
         super().set_gguf_parameters()
         self._try_set_pooling_type()
 
         # Add parameters similar to LlamaModel
-        hparams = self.hparams
         self.gguf_writer.add_vocab_size(hparams["vocab_size"])
 
         if (rope_dim := hparams.get("head_dim")) is None:
             n_heads = hparams.get("num_attention_heads", hparams.get("n_heads"))
             assert n_heads is not None
-            rope_dim = hparams.get("hidden_size", hparams.get("d_model")) // n_heads
+            rope_dim = hparams["hidden_size"] // n_heads
         self.gguf_writer.add_rope_dimension_count(rope_dim)
-
-        # Set context length for LLaDA
-        context_length = self.hparams.get("max_sequence_length", 4096)
-        self.gguf_writer.add_context_length(context_length)
-
-        # Set embedding length (dimension size)
-        embedding_length = self.hparams.get("d_model", 4096)
-        self.gguf_writer.add_embedding_length(embedding_length)
-
-        # Set feed forward length (MLP hidden size)
-        feed_forward_length = self.hparams.get("mlp_hidden_size", 12288)
-        self.gguf_writer.add_feed_forward_length(feed_forward_length)
 
         # LLaDA models use non-causal attention for diffusion, similar to Dream
         self.gguf_writer.add_causal_attention(False)
 
         # LLaDA models don't shift their logits
         self.gguf_writer.add_diffusion_shift_logits(False)
+
+        mask_token_id = hparams.get("mask_token_id")
+        if mask_token_id is None and self.hf_arch == "LLaDAOGuiForDiffusionLM":
+            from transformers import AutoTokenizer
+
+            tokenizer = AutoTokenizer.from_pretrained(self.dir_model, trust_remote_code=True)
+            mask_token_id = tokenizer.convert_tokens_to_ids("<|mdm_mask|>")
+        if mask_token_id is not None:
+            self.gguf_writer.add_mask_token_id(int(mask_token_id))
 
     @staticmethod
     def permute(weights: Tensor, n_head: int, n_head_kv: int | None):
@@ -108,6 +132,8 @@ class LLaDAModel(TextModel):
                 data_torch = LLaDAModel.permute(data_torch, n_head, n_head)
             if name.endswith(("k_proj.weight", "k_proj.bias")):
                 data_torch = LLaDAModel.permute(data_torch, n_head, n_kv_head)
+            if name.endswith(("q_norm.weight", "k_norm.weight")):
+                data_torch = LLaDAModel.permute(data_torch, 1, 1)
 
         # LLaDA model tensors should be mapped directly since it's the base model
         yield from super().modify_tensors(data_torch, name, bid)

@@ -570,6 +570,7 @@ class VISION_PROJECTOR_TYPE(IntEnum):
     QWEN3VL   = auto()
     STEP3VL   = auto()
     COGVLM    = auto()
+    LLADAO    = auto()
 
 
 class MODEL_TENSOR(IntEnum):
@@ -828,6 +829,7 @@ class MODEL_TENSOR(IntEnum):
     V_POST_NORM          = auto()
     V_MM_PRE_NORM        = auto() # hunyuanvl
     V_MM_POST_NORM       = auto()
+    V_MM_POS_EMBD        = auto() # llada-o post-projector dynamic position embedding
     V_MM_INP_NORM        = auto()
     V_MM_INP_PROJ        = auto() # gemma3
     V_MM_SOFT_EMB_NORM   = auto() # gemma3
@@ -1180,6 +1182,7 @@ VISION_PROJECTOR_TYPE_NAMES: dict[VISION_PROJECTOR_TYPE, str] = {
     VISION_PROJECTOR_TYPE.GEMMA3:    "gemma3",
     VISION_PROJECTOR_TYPE.QWEN3VL:   "qwen3vl_merger",
     VISION_PROJECTOR_TYPE.STEP3VL:   "step3vl",
+    VISION_PROJECTOR_TYPE.LLADAO:    "lladao",
 }
 
 TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
@@ -1437,6 +1440,7 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.V_PRE_NORM:                "v.pre_ln",
     MODEL_TENSOR.V_POST_NORM:               "v.post_ln",
     MODEL_TENSOR.V_MM_POST_NORM:            "mm.post_norm",
+    MODEL_TENSOR.V_MM_POS_EMBD:             "mm.position_embd",
     MODEL_TENSOR.V_MM_INP_PROJ:             "mm.input_projection",
     MODEL_TENSOR.V_MM_INP_NORM:             "mm.input_norm",
     MODEL_TENSOR.V_MM_SOFT_EMB_NORM:        "mm.soft_emb_norm",         # gemma3n
@@ -1671,6 +1675,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.V_PRE_NORM,
         MODEL_TENSOR.V_POST_NORM,
         MODEL_TENSOR.V_MM_POST_NORM,
+        MODEL_TENSOR.V_MM_POS_EMBD,
         MODEL_TENSOR.V_MM_INP_PROJ,
         MODEL_TENSOR.V_MM_INP_NORM,
         MODEL_TENSOR.V_MM_SOFT_EMB_NORM,
@@ -2224,7 +2229,9 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.ROPE_FREQS,
         MODEL_TENSOR.ATTN_NORM,
         MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_Q_NORM,
         MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_K_NORM,
         MODEL_TENSOR.ATTN_V,
         MODEL_TENSOR.ATTN_OUT,
         MODEL_TENSOR.FFN_NORM,
@@ -4881,6 +4888,7 @@ class VisionProjectorType:
     MIMOVL         = "mimovl"
     MIMO_AUDIO     = "mimo_audio"
     GRANITE4_VISION = "granite4_vision"
+    LLADAO          = "lladao"
 
 
 # Items here are (block size, type size)
