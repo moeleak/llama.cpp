@@ -25,6 +25,10 @@ struct d2f_engine_params {
 
 struct d2f_request {
     std::string image_path;
+    // Stable content identity supplied by the caller. Reusing this key allows a
+    // planner and grounding request over the exact same screenshot to share the
+    // vision-tower output even when a language LoRA is switched between them.
+    std::string image_cache_key;
     std::string prompt;
     std::string retrieval_query;
     int32_t full_page_tile_size = 980;
@@ -44,7 +48,9 @@ struct d2f_result {
     double prefill_seconds = 0.0;
     double state_io_seconds = 0.0;
     double decode_seconds = 0.0;
+    double vision_encode_seconds = 0.0;
     double generation_seconds = 0.0;
+    bool vision_cache_hit = false;
     bool cancelled = false;
     bool preprocessed_only = false;
     bool prefilled_only = false;

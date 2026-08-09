@@ -1243,6 +1243,8 @@ struct d2f_engine::impl {
     llama_token vision_end = LLAMA_TOKEN_NULL;
     std::unique_ptr<token_embedding_reader> token_embeddings;
     mtmd::context_ptr native_vision;
+    std::unique_ptr<encoded_image> cached_native_image;
+    std::string cached_native_image_key;
     llama_adapter_lora_ptr adapter;
     std::string adapter_path;
     float adapter_scale = 1.0f;
@@ -1679,6 +1681,7 @@ struct d2f_engine::impl {
             throw std::invalid_argument("GUI operation and retrieval query must not be blank");
         }
 
+        d2f_result result;
         std::vector<encoded_image> native_images;
         full_page_images page;
         std::vector<const encoded_image *> selected_images;
@@ -1690,7 +1693,10 @@ struct d2f_engine::impl {
 
         if (p.full_page_tiles) {
             native_vision.reset();
+            const auto vision_started = std::chrono::steady_clock::now();
             page = encode_full_page(p, model.get(), n_embd);
+            result.vision_encode_seconds = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - vision_started).count();
             if (page.sources.empty()) {
                 throw std::runtime_error("full-page tiling produced no source images");
             }
@@ -1729,17 +1735,39 @@ struct d2f_engine::impl {
             }
         } else {
             prompt_tokens = add_text_boundaries(vocab, operation);
-            if (!native_vision) {
-                native_vision = make_vision_context(base, model.get(), false);
+            if (!request.image_cache_key.empty() && cached_native_image &&
+                cached_native_image_key == request.image_cache_key) {
+                result.vision_cache_hit = true;
+                selected_images.push_back(cached_native_image.get());
+            } else {
+                if (!native_vision) {
+                    native_vision = make_vision_context(base, model.get(), false);
+                }
+                const auto vision_started = std::chrono::steady_clock::now();
+                encoded_image image = encode_image(native_vision.get(), p.image, n_embd);
+                result.vision_encode_seconds = std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - vision_started).count();
+                image.dense_position = 0;
+                if (request.image_cache_key.empty()) {
+                    native_images.push_back(std::move(image));
+                    selected_images.push_back(&native_images.back());
+                } else {
+                    cached_native_image = std::make_unique<encoded_image>(std::move(image));
+                    cached_native_image_key = request.image_cache_key;
+                    selected_images.push_back(cached_native_image.get());
+                }
             }
-            native_images.push_back(encode_image(native_vision.get(), p.image, n_embd));
-            native_images.back().dense_position = 0;
-            selected_images.push_back(&native_images.back());
-            dense_image_length = native_images.back().n_tokens + 2;
+            dense_image_length = selected_images.back()->n_tokens + 2;
             max_work_tokens =
                     dense_image_length +
                     static_cast<int32_t>(prompt_tokens.size()) +
                     D2F_GENERATION_LENGTH;
+            std::fprintf(
+                    stderr,
+                    "D2F vision_cache=%s key=%s encode_seconds=%.6f\n",
+                    result.vision_cache_hit ? "hit" : "miss",
+                    request.image_cache_key.empty() ? "none" : "content",
+                    result.vision_encode_seconds);
         }
 
         if (max_work_tokens > p.n_ctx) {
@@ -1749,7 +1777,6 @@ struct d2f_engine::impl {
                     " tokens but context size is " + std::to_string(p.n_ctx));
         }
 
-        d2f_result result;
         if (p.preprocess_only) {
             if (selected_images.empty()) {
                 const size_t count = std::min(
