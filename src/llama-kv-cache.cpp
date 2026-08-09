@@ -4,6 +4,7 @@
 #include "llama-io.h"
 #include "llama-model.h"
 #include "llama-context.h"
+#include "llama-d2f-mask.h"
 
 #include <algorithm>
 #include <cassert>
@@ -1906,6 +1907,97 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
 }
 
+template<typename T>
+static void set_input_kq_mask_d2f_impl(
+        const args_set_input_kq_mask & args,
+        T * data,
+        int32_t prompt_position,
+        int32_t generation_position,
+        int32_t block_size) {
+    const auto * ubatch = args.ubatch;
+    const int64_t n_kv = args.n_kv;
+    const int64_t n_stream = args.n_stream;
+    const int64_t n_tps = args.n_tps;
+
+    std::fill(data, data + n_kv*ubatch->n_tokens, llama_cast<T>(-INFINITY));
+
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        for (uint32_t ii = 0; ii < n_tps; ++ii) {
+            const uint32_t i = s*n_tps + ii;
+            const llama_seq_id seq_id = ubatch->seq_id[i][0];
+            const auto & cells = args.v_cells.at(args.seq_to_stream[seq_id]);
+            const llama_pos p1 = ubatch->pos[i];
+            const uint64_t idst = n_kv*i;
+
+            for (uint32_t j = 0; j < n_kv; ++j) {
+                if (cells.is_empty(j) || !cells.seq_has(j, seq_id)) {
+                    continue;
+                }
+
+                const llama_pos p0 = cells.pos_get(j);
+                if (!llm_d2f_attention_visible_position(
+                            p1,
+                            p0,
+                            prompt_position,
+                            generation_position,
+                            block_size)) {
+                    continue;
+                }
+                if (llama_hparams::is_masked_swa(args.n_swa, args.swa_type, p0, p1)) {
+                    continue;
+                }
+
+                data[idst + j] = llama_cast<T>(
+                        args.hparams.use_alibi ? static_cast<float>(-std::abs(p0 - p1)) : 0.0f);
+            }
+        }
+    }
+}
+
+void llama_kv_cache::set_input_kq_mask_d2f(
+        ggml_tensor * dst,
+        const llama_ubatch * ubatch,
+        int32_t prompt_position,
+        int32_t generation_position,
+        int32_t block_size) const {
+    GGML_ASSERT(prompt_position >= 0);
+    GGML_ASSERT(generation_position >= prompt_position);
+    GGML_ASSERT(block_size > 0);
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+
+    const int64_t n_kv = dst->ne[0];
+    const int64_t n_stream = dst->ne[3];
+    GGML_ASSERT(ubatch->n_tokens % n_stream == 0);
+
+    const args_set_input_kq_mask args = {
+        /*.hparams       =*/ hparams,
+        /*.ubatch        =*/ ubatch,
+        /*.v_cells       =*/ v_cells,
+        /*.seq_to_stream =*/ seq_to_stream,
+        /*.n_swa         =*/ n_swa,
+        /*.swa_type      =*/ swa_type,
+        /*.n_kv          =*/ n_kv,
+        /*.n_stream      =*/ n_stream,
+        /*.n_tps         =*/ ubatch->n_tokens/n_stream,
+    };
+
+    if (dst->type == GGML_TYPE_F16) {
+        set_input_kq_mask_d2f_impl(
+                args,
+                (ggml_fp16_t *) dst->data,
+                prompt_position,
+                generation_position,
+                block_size);
+    } else {
+        set_input_kq_mask_d2f_impl(
+                args,
+                (float *) dst->data,
+                prompt_position,
+                generation_position,
+                block_size);
+    }
+}
+
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     const int64_t n_tokens = ubatch->n_tokens;
 
@@ -2890,6 +2982,20 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     kv->set_input_kq_mask(dst, ubatch, causal_attn);
+}
+
+void llama_kv_cache_context::set_input_kq_mask_d2f(
+        ggml_tensor * dst,
+        const llama_ubatch * ubatch,
+        int32_t prompt_position,
+        int32_t generation_position,
+        int32_t block_size) const {
+    kv->set_input_kq_mask_d2f(
+            dst,
+            ubatch,
+            prompt_position,
+            generation_position,
+            block_size);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

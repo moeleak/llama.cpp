@@ -214,6 +214,12 @@ public:
     void set_input_k_shift(ggml_tensor * dst) const;
 
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_kq_mask_d2f(
+            ggml_tensor * dst,
+            const llama_ubatch * ubatch,
+            int32_t prompt_position,
+            int32_t generation_position,
+            int32_t block_size) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
@@ -404,6 +410,12 @@ public:
 
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_kq_mask_d2f(
+            ggml_tensor * dst,
+            const llama_ubatch * ubatch,
+            int32_t prompt_position,
+            int32_t generation_position,
+            int32_t block_size) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;

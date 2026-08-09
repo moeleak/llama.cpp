@@ -20,10 +20,12 @@ struct llama_cparams {
 
     int32_t  nextn_layer_offset = 0;
 
-    // Optional D2F mask for no-cache diffusion decoding. A negative prefix
-    // length or non-positive block size disables it.
+    // Optional D2F mask for diffusion decoding. Invalid positions or a
+    // non-positive block size disable it.
     int32_t d2f_image_prefix_length = -1;
     int32_t d2f_prefix_length       = -1;
+    int32_t d2f_prompt_position     = -1;
+    int32_t d2f_generation_position = -1;
     int32_t d2f_block_size          = 0;
 
     float rope_freq_base;

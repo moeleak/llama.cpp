@@ -779,6 +779,8 @@ struct llm_graph_params {
             cparams.causal_attn             == other.cparams.causal_attn             &&
             cparams.d2f_image_prefix_length == other.cparams.d2f_image_prefix_length &&
             cparams.d2f_prefix_length       == other.cparams.d2f_prefix_length       &&
+            cparams.d2f_prompt_position     == other.cparams.d2f_prompt_position     &&
+            cparams.d2f_generation_position == other.cparams.d2f_generation_position &&
             cparams.d2f_block_size          == other.cparams.d2f_block_size          &&
             arch  == other.arch  &&
             gtype == other.gtype &&

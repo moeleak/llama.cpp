@@ -4,6 +4,7 @@
 #include "llama-model.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
+#include "llama-d2f-mask.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -414,6 +415,8 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
         const bool use_d2f_mask =
             cparams.d2f_image_prefix_length >= 0 &&
             cparams.d2f_prefix_length >= 0 &&
+            cparams.d2f_prompt_position >= 0 &&
+            cparams.d2f_generation_position >= cparams.d2f_prompt_position &&
             cparams.d2f_block_size > 0;
         GGML_ASSERT(!use_d2f_mask ||
             (cparams.d2f_image_prefix_length <= cparams.d2f_prefix_length &&
@@ -435,27 +438,12 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
                 }
 
                 if (use_d2f_mask) {
-                    const int32_t image_prefix_length = cparams.d2f_image_prefix_length;
-                    const int32_t prefix_length = cparams.d2f_prefix_length;
-                    const int32_t block_size = cparams.d2f_block_size;
-
-                    bool visible = false;
-                    if (i1 < image_prefix_length) {
-                        // Image queries see the image split, but never the
-                        // following question/instruction text.
-                        visible = i0 < image_prefix_length;
-                    } else if (i1 < prefix_length) {
-                        // Text queries see both complete prefix splits.
-                        visible = i0 < prefix_length;
-                    } else if (i0 < prefix_length) {
-                        visible = true;
-                    } else {
-                        const int32_t query_block = (i1 - prefix_length) / block_size;
-                        const int32_t key_block = (i0 - prefix_length) / block_size;
-                        visible = key_block <= query_block;
-                    }
-
-                    if (!visible) {
+                    if (!llm_d2f_attention_visible_position(
+                                p1,
+                                p0,
+                                cparams.d2f_prompt_position,
+                                cparams.d2f_generation_position,
+                                cparams.d2f_block_size)) {
                         continue;
                     }
                 } else if (cparams.causal_attn && p0 > p1) {
@@ -503,7 +491,20 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     // the mask is left unallocated when the graph only stores K/V without attending
     // (e.g. DFlash's KV-injection pass)
     if (self_kq_mask && self_kq_mask->buffer) {
-        mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+        const bool use_d2f_mask =
+                cparams.d2f_prompt_position >= 0 &&
+                cparams.d2f_generation_position >= cparams.d2f_prompt_position &&
+                cparams.d2f_block_size > 0;
+        if (use_d2f_mask) {
+            mctx->set_input_kq_mask_d2f(
+                    self_kq_mask,
+                    ubatch,
+                    cparams.d2f_prompt_position,
+                    cparams.d2f_generation_position,
+                    cparams.d2f_block_size);
+        } else {
+            mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+        }
     }
 
     if (self_k_rot && self_k_rot->buffer) {

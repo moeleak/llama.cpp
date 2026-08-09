@@ -2,12 +2,17 @@
 #include "ggml-cpp.h"
 #include "ggml.h"
 #include "gguf.h"
+#include "lladao-d2f-engine.h"
 #include "llama-cpp.h"
 #include "llama.h"
 #include "mtmd-helper.h"
 #include "mtmd.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cctype>
 #include <cerrno>
 #include <cinttypes>
 #include <cstdio>
@@ -16,6 +21,8 @@
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <mutex>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -33,12 +40,23 @@ struct params {
     std::string lora;
     std::string image;
     std::string prompt;
+    std::string retrieval_query;
     int32_t     n_ctx          = 16384;
     int32_t     n_gpu_layers   = 999;
     int32_t     n_threads      = 0;
     int32_t     max_iterations = 256;
     int32_t     mask_token_id  = LLAMA_TOKEN_NULL;
+    int32_t     full_page_tile_size       = 980;
+    int32_t     tile_retrieval_topk       = 0;
+    int32_t     tile_retrieval_mask_rounds = 2;
+    int32_t     yarn_orig_ctx             = 16384;
+    float       yarn_factor               = 1.0f;
+    int8_t      vision_gpu     = -1;
+    bool        full_page_tiles = false;
+    bool        full_page_overview = true;
     bool        preprocess_only = false;
+    bool        prefix_cache = true;
+    bool        print_timings = true;
 };
 
 void print_usage(const char * program) {
@@ -56,9 +74,25 @@ void print_usage(const char * program) {
             "  --lora PATH           Optional F32 D2F LoRA GGUF\n"
             "  --ctx-size N          Context capacity (default: 16384)\n"
             "  --gpu-layers N        Layers to offload (default: 999)\n"
+            "  --vision-gpu          Offload the vision projector even with --gpu-layers 0\n"
+            "  --no-vision-gpu       Keep the vision projector on the CPU\n"
             "  --threads N           CPU threads (default: backend choice)\n"
             "  --max-iterations N    D2F iteration limit (default: 256)\n"
+            "  --no-prefix-cache     Recompute the complete sequence every D2F iteration\n"
             "  --mask-token-id N     Override missing tokenizer mask metadata\n"
+            "  --full-page-tiles     Split the original page into exact row-major tiles\n"
+            "  --full-page-tile-size N\n"
+            "                        Tile edge in pixels (default: 980)\n"
+            "  --no-full-page-overview\n"
+            "                        Do not append the native-resized whole-page overview\n"
+            "  --tile-retrieval-topk N\n"
+            "                        Keep the Top-N source tiles; 0 keeps all (default: 0)\n"
+            "  --retrieval-query TEXT\n"
+            "                        Override the operation-only retrieval query\n"
+            "  --tile-retrieval-mask-rounds N\n"
+            "                        Complementary masked-query rounds (default: 2)\n"
+            "  --yarn-factor F       YaRN RoPE factor; 1 disables scaling (default: 1)\n"
+            "  --yarn-orig-ctx N     YaRN original context length (default: 16384)\n"
             "  --preprocess-only     Stop after validating multimodal layout\n"
             "  -h, --help            Show this help\n",
             program);
@@ -74,6 +108,16 @@ int32_t parse_i32(const char * flag, const char * value) {
         throw std::invalid_argument(std::string("invalid value for ") + flag + ": " + value);
     }
     return static_cast<int32_t>(parsed);
+}
+
+float parse_float(const char * flag, const char * value) {
+    errno = 0;
+    char * end = nullptr;
+    const float parsed = std::strtof(value, &end);
+    if (errno != 0 || end == value || *end != '\0' || !std::isfinite(parsed)) {
+        throw std::invalid_argument(std::string("invalid value for ") + flag + ": " + value);
+    }
+    return parsed;
 }
 
 params parse_args(int argc, char ** argv) {
@@ -101,12 +145,35 @@ params parse_args(int argc, char ** argv) {
             result.n_ctx = parse_i32(arg.c_str(), next());
         } else if (arg == "--gpu-layers" || arg == "-ngl") {
             result.n_gpu_layers = parse_i32(arg.c_str(), next());
+        } else if (arg == "--vision-gpu") {
+            result.vision_gpu = 1;
+        } else if (arg == "--no-vision-gpu") {
+            result.vision_gpu = 0;
         } else if (arg == "--threads" || arg == "-t") {
             result.n_threads = parse_i32(arg.c_str(), next());
         } else if (arg == "--max-iterations") {
             result.max_iterations = parse_i32(arg.c_str(), next());
+        } else if (arg == "--no-prefix-cache") {
+            result.prefix_cache = false;
         } else if (arg == "--mask-token-id") {
             result.mask_token_id = parse_i32(arg.c_str(), next());
+        } else if (arg == "--full-page-tiles") {
+            result.full_page_tiles = true;
+        } else if (arg == "--full-page-tile-size") {
+            result.full_page_tile_size = parse_i32(arg.c_str(), next());
+        } else if (arg == "--no-full-page-overview") {
+            result.full_page_overview = false;
+        } else if (arg == "--tile-retrieval-topk") {
+            result.tile_retrieval_topk = parse_i32(arg.c_str(), next());
+            result.full_page_tiles = true;
+        } else if (arg == "--retrieval-query") {
+            result.retrieval_query = next();
+        } else if (arg == "--tile-retrieval-mask-rounds") {
+            result.tile_retrieval_mask_rounds = parse_i32(arg.c_str(), next());
+        } else if (arg == "--yarn-factor") {
+            result.yarn_factor = parse_float(arg.c_str(), next());
+        } else if (arg == "--yarn-orig-ctx") {
+            result.yarn_orig_ctx = parse_i32(arg.c_str(), next());
         } else if (arg == "--preprocess-only") {
             result.preprocess_only = true;
         } else if (arg == "--help" || arg == "-h") {
@@ -122,6 +189,15 @@ params parse_args(int argc, char ** argv) {
     }
     if (result.n_ctx <= 0 || result.n_threads < 0 || result.max_iterations <= 0) {
         throw std::invalid_argument("context size, threads, and max iterations must be valid");
+    }
+    if (result.full_page_tile_size <= 0 || result.full_page_tile_size > 980) {
+        throw std::invalid_argument("--full-page-tile-size must be in [1, 980]");
+    }
+    if (result.tile_retrieval_topk < 0 || result.tile_retrieval_mask_rounds <= 0) {
+        throw std::invalid_argument("retrieval Top-K and mask rounds must be valid");
+    }
+    if (result.yarn_factor < 1.0f || result.yarn_orig_ctx <= 0) {
+        throw std::invalid_argument("YaRN factor and original context must be valid");
     }
     return result;
 }
@@ -272,15 +348,24 @@ class token_embedding_reader {
 struct encoded_image {
     std::vector<float> embeddings;
     int32_t n_tokens = 0;
+    int32_t source_index = 0;
+    llama_pos dense_position = 0;
+    bool overview = false;
 };
 
-encoded_image encode_image(
-        mtmd_context * mctx,
-        const std::string & image_path,
-        int32_t n_embd) {
+using bitmap_ptr = std::unique_ptr<mtmd_bitmap, decltype(&mtmd_bitmap_free)>;
+
+struct tile_box {
+    int32_t x0;
+    int32_t y0;
+    int32_t x1;
+    int32_t y1;
+};
+
+bitmap_ptr load_image(mtmd_context * mctx, const std::string & image_path) {
     mtmd_helper_bitmap_wrapper wrapper =
             mtmd_helper_bitmap_init_from_file(mctx, image_path.c_str(), false);
-    std::unique_ptr<mtmd_bitmap, decltype(&mtmd_bitmap_free)> bitmap(wrapper.bitmap, mtmd_bitmap_free);
+    bitmap_ptr bitmap(wrapper.bitmap, mtmd_bitmap_free);
     std::unique_ptr<mtmd_helper_video, decltype(&mtmd_helper_video_free)>
             video(wrapper.video_ctx, mtmd_helper_video_free);
     if (!bitmap) {
@@ -289,12 +374,18 @@ encoded_image encode_image(
     if (mtmd_bitmap_is_audio(bitmap.get())) {
         throw std::runtime_error("LLaDA-o requires an image, not audio");
     }
+    return bitmap;
+}
 
+encoded_image encode_bitmap(
+        mtmd_context * mctx,
+        const mtmd_bitmap * bitmap,
+        int32_t n_embd) {
     mtmd::input_chunks chunks(mtmd_input_chunks_init());
     if (!chunks.ptr) {
         throw std::runtime_error("failed to allocate multimodal chunks");
     }
-    const mtmd_bitmap * bitmaps[] = { bitmap.get() };
+    const mtmd_bitmap * bitmaps[] = { bitmap };
     const std::string marker = mtmd_get_marker(mctx);
     mtmd_input_text input = {
         /*.text          =*/ marker.data(),
@@ -341,6 +432,75 @@ encoded_image encode_image(
     return result;
 }
 
+encoded_image encode_image(
+        mtmd_context * mctx,
+        const std::string & image_path,
+        int32_t n_embd) {
+    const bitmap_ptr bitmap = load_image(mctx, image_path);
+    return encode_bitmap(mctx, bitmap.get(), n_embd);
+}
+
+std::vector<tile_box> full_page_tile_boxes(
+        int32_t width,
+        int32_t height,
+        int32_t tile_size) {
+    if (width <= 0 || height <= 0 || tile_size <= 0) {
+        throw std::invalid_argument("full-page dimensions and tile size must be positive");
+    }
+
+    std::vector<tile_box> boxes;
+    for (int32_t y = 0; y < height; y += tile_size) {
+        for (int32_t x = 0; x < width; x += tile_size) {
+            boxes.push_back({
+                x,
+                y,
+                std::min(x + tile_size, width),
+                std::min(y + tile_size, height),
+            });
+        }
+    }
+    return boxes;
+}
+
+bitmap_ptr crop_bitmap(const mtmd_bitmap * bitmap, const tile_box & box) {
+    const int32_t source_width  = static_cast<int32_t>(mtmd_bitmap_get_nx(bitmap));
+    const int32_t source_height = static_cast<int32_t>(mtmd_bitmap_get_ny(bitmap));
+    if (box.x0 < 0 || box.y0 < 0 || box.x0 >= box.x1 || box.y0 >= box.y1 ||
+        box.x1 > source_width || box.y1 > source_height) {
+        throw std::invalid_argument("tile box lies outside the source image");
+    }
+
+    const int32_t width  = box.x1 - box.x0;
+    const int32_t height = box.y1 - box.y0;
+    const unsigned char * source = mtmd_bitmap_get_data(bitmap);
+    if (!source) {
+        throw std::runtime_error("source bitmap has no pixel data");
+    }
+
+    std::vector<unsigned char> pixels(
+            static_cast<size_t>(width) * static_cast<size_t>(height) * 3);
+    for (int32_t y = 0; y < height; ++y) {
+        const size_t source_offset =
+                (static_cast<size_t>(box.y0 + y) * source_width + box.x0) * 3;
+        const size_t destination_offset = static_cast<size_t>(y) * width * 3;
+        std::copy_n(
+                source + source_offset,
+                static_cast<size_t>(width) * 3,
+                pixels.data() + destination_offset);
+    }
+
+    bitmap_ptr result(
+            mtmd_bitmap_init(
+                    static_cast<uint32_t>(width),
+                    static_cast<uint32_t>(height),
+                    pixels.data()),
+            mtmd_bitmap_free);
+    if (!result) {
+        throw std::bad_alloc();
+    }
+    return result;
+}
+
 struct prefix {
     std::vector<float> embeddings;
     std::vector<llama_pos> positions;
@@ -355,26 +515,36 @@ void append_embedding(std::vector<float> & destination, const std::vector<float>
 
 prefix build_prefix(
         token_embedding_reader & token_embeddings,
-        const encoded_image & image,
+        const std::vector<const encoded_image *> & images,
         const std::vector<llama_token> & prompt_tokens,
         llama_token vision_start,
         llama_token vision_end,
+        llama_pos prompt_position,
         int32_t n_embd) {
     prefix result;
-    const size_t prefix_tokens =
-            static_cast<size_t>(image.n_tokens) + 2 + prompt_tokens.size();
+    size_t image_tokens = 0;
+    for (const encoded_image * image : images) {
+        image_tokens += static_cast<size_t>(image->n_tokens) + 2;
+    }
+    const size_t prefix_tokens = image_tokens + prompt_tokens.size();
     result.embeddings.reserve(prefix_tokens * static_cast<size_t>(n_embd));
     result.positions.reserve(prefix_tokens);
 
-    append_embedding(result.embeddings, token_embeddings.get(vision_start));
-    result.positions.push_back(0);
-    result.embeddings.insert(result.embeddings.end(), image.embeddings.begin(), image.embeddings.end());
-    result.positions.insert(result.positions.end(), static_cast<size_t>(image.n_tokens), 0);
-    append_embedding(result.embeddings, token_embeddings.get(vision_end));
-    result.positions.push_back(0);
-    result.image_length = image.n_tokens + 2;
+    for (const encoded_image * image : images) {
+        append_embedding(result.embeddings, token_embeddings.get(vision_start));
+        result.positions.push_back(image->dense_position);
+        result.embeddings.insert(
+                result.embeddings.end(), image->embeddings.begin(), image->embeddings.end());
+        result.positions.insert(
+                result.positions.end(),
+                static_cast<size_t>(image->n_tokens),
+                image->dense_position);
+        append_embedding(result.embeddings, token_embeddings.get(vision_end));
+        result.positions.push_back(image->dense_position);
+        result.image_length += image->n_tokens + 2;
+    }
 
-    llama_pos position = 1;
+    llama_pos position = prompt_position;
     for (llama_token token : prompt_tokens) {
         append_embedding(result.embeddings, token_embeddings.get(token));
         result.positions.push_back(position++);
@@ -407,6 +577,206 @@ class batch_owner {
     llama_batch batch_;
 };
 
+void initialize_batch_rows(llama_batch & batch, int32_t n_tokens) {
+    batch.n_tokens = n_tokens;
+    for (int32_t i = 0; i < n_tokens; ++i) {
+        batch.n_seq_id[i]  = 1;
+        batch.seq_id[i][0] = 0;
+        batch.logits[i]    = 0;
+    }
+}
+
+double same_position_cross_entropy(
+        const float * logits,
+        int32_t n_vocab,
+        llama_token target) {
+    if (!logits || target < 0 || target >= n_vocab) {
+        throw std::runtime_error("invalid logits row or masked-query target");
+    }
+
+    float maximum = -std::numeric_limits<float>::infinity();
+    for (int32_t token = 0; token < n_vocab; ++token) {
+        maximum = std::max(maximum, logits[token]);
+    }
+
+    double exponential_sum = 0.0;
+    for (int32_t token = 0; token < n_vocab; ++token) {
+        exponential_sum += std::exp(static_cast<double>(logits[token] - maximum));
+    }
+    return static_cast<double>(maximum) + std::log(exponential_sum) - logits[target];
+}
+
+double score_image_with_masked_query(
+        llama_context * context,
+        batch_owner & owned_batch,
+        token_embedding_reader & token_embeddings,
+        const encoded_image & image,
+        const std::vector<llama_token> & clean_query,
+        llama_token vision_start,
+        llama_token vision_end,
+        llama_token mask,
+        llama_pos query_position,
+        int32_t mask_rounds,
+        int32_t n_embd,
+        int32_t n_vocab) {
+    if (clean_query.size() < 3) {
+        throw std::invalid_argument("retrieval query must contain at least one non-boundary token");
+    }
+
+    const int32_t image_length = image.n_tokens + 2;
+    const int32_t query_length = static_cast<int32_t>(clean_query.size());
+    const int32_t document_length = image_length + query_length;
+    const int32_t effective_rounds = std::min(mask_rounds, query_length - 2);
+    double loss_sum = 0.0;
+    int32_t scored_tokens = 0;
+
+    for (int32_t round = 0; round < effective_rounds; ++round) {
+        std::vector<int32_t> target_indices;
+        for (int32_t query_index = 1 + round;
+             query_index < query_length - 1;
+             query_index += effective_rounds) {
+            target_indices.push_back(query_index);
+        }
+        if (target_indices.empty()) {
+            continue;
+        }
+
+        llama_batch & batch = owned_batch.get();
+        initialize_batch_rows(batch, document_length);
+
+        int32_t row = 0;
+        auto append_token_embedding = [&](llama_token token, llama_pos position) {
+            const std::vector<float> & embedding = token_embeddings.get(token);
+            std::copy(
+                    embedding.begin(),
+                    embedding.end(),
+                    batch.embd + static_cast<size_t>(row) * n_embd);
+            batch.pos[row++] = position;
+        };
+
+        append_token_embedding(vision_start, image.dense_position);
+        std::copy(
+                image.embeddings.begin(),
+                image.embeddings.end(),
+                batch.embd + static_cast<size_t>(row) * n_embd);
+        std::fill_n(batch.pos + row, image.n_tokens, image.dense_position);
+        row += image.n_tokens;
+        append_token_embedding(vision_end, image.dense_position);
+
+        for (int32_t query_index = 0; query_index < query_length; ++query_index) {
+            const bool is_target =
+                    std::binary_search(target_indices.begin(), target_indices.end(), query_index);
+            append_token_embedding(
+                    is_target ? mask : clean_query[query_index],
+                    query_position + query_index);
+            if (is_target) {
+                batch.logits[image_length + query_index] = 1;
+            }
+        }
+        if (row != document_length) {
+            throw std::logic_error("masked-query document layout is inconsistent");
+        }
+
+        llama_memory_clear(llama_get_memory(context), true);
+        const int32_t decode_result = llama_decode(context, batch);
+        if (decode_result != 0) {
+            throw std::runtime_error(
+                    "masked-query llama_decode failed with code " +
+                    std::to_string(decode_result));
+        }
+
+        for (int32_t query_index : target_indices) {
+            const int32_t batch_index = image_length + query_index;
+            const float * logits = llama_get_logits_ith(context, batch_index);
+            loss_sum += same_position_cross_entropy(
+                    logits, n_vocab, clean_query[query_index]);
+            ++scored_tokens;
+        }
+    }
+
+    const int32_t expected_tokens = query_length - 2;
+    if (scored_tokens != expected_tokens) {
+        throw std::logic_error(
+                "complementary mask rounds scored " + std::to_string(scored_tokens) +
+                " tokens, expected " + std::to_string(expected_tokens));
+    }
+    return -loss_sum / static_cast<double>(scored_tokens);
+}
+
+struct retrieval_result {
+    std::vector<double> scores;
+    std::vector<int32_t> selected_source_indices;
+    double latency_seconds = 0.0;
+};
+
+retrieval_result retrieve_image_tiles(
+        llama_context * context,
+        batch_owner & owned_batch,
+        token_embedding_reader & token_embeddings,
+        const std::vector<encoded_image> & source_images,
+        const std::vector<llama_token> & clean_query,
+        llama_token vision_start,
+        llama_token vision_end,
+        llama_token mask,
+        llama_pos query_position,
+        int32_t topk,
+        int32_t mask_rounds,
+        int32_t n_embd,
+        int32_t n_vocab) {
+    if (topk <= 0) {
+        throw std::invalid_argument("tile retrieval Top-K must be positive");
+    }
+
+    const auto started = std::chrono::steady_clock::now();
+    retrieval_result result;
+    result.scores.reserve(source_images.size());
+    for (const encoded_image & image : source_images) {
+        const double score = score_image_with_masked_query(
+                context,
+                owned_batch,
+                token_embeddings,
+                image,
+                clean_query,
+                vision_start,
+                vision_end,
+                mask,
+                query_position,
+                mask_rounds,
+                n_embd,
+                n_vocab);
+        if (!std::isfinite(score)) {
+            throw std::runtime_error("masked-query tile score is not finite");
+        }
+        result.scores.push_back(score);
+        std::fprintf(
+                stderr,
+                "tile_retrieval score source=%" PRId32 " value=%.8f\n",
+                image.source_index,
+                score);
+    }
+
+    std::vector<int32_t> rank(source_images.size());
+    std::iota(rank.begin(), rank.end(), 0);
+    std::stable_sort(rank.begin(), rank.end(), [&](int32_t left, int32_t right) {
+        if (result.scores[left] != result.scores[right]) {
+            return result.scores[left] > result.scores[right];
+        }
+        return source_images[left].source_index < source_images[right].source_index;
+    });
+    rank.resize(std::min(static_cast<size_t>(topk), rank.size()));
+    for (int32_t index : rank) {
+        result.selected_source_indices.push_back(source_images[index].source_index);
+    }
+    std::sort(
+            result.selected_source_indices.begin(),
+            result.selected_source_indices.end());
+
+    const auto finished = std::chrono::steady_clock::now();
+    result.latency_seconds =
+            std::chrono::duration<double>(finished - started).count();
+    return result;
+}
+
 void fill_batch(
         llama_batch & batch,
         const prefix & input_prefix,
@@ -415,7 +785,7 @@ void fill_batch(
         token_embedding_reader & token_embeddings,
         int32_t n_embd) {
     const int32_t n_tokens = input_prefix.total_length + active_generation_length;
-    batch.n_tokens = n_tokens;
+    initialize_batch_rows(batch, n_tokens);
 
     std::copy(input_prefix.embeddings.begin(), input_prefix.embeddings.end(), batch.embd);
     std::copy(input_prefix.positions.begin(), input_prefix.positions.end(), batch.pos);
@@ -429,31 +799,222 @@ void fill_batch(
         batch.pos[input_prefix.total_length + i] = input_prefix.generation_position + i;
     }
 
-    for (int32_t i = 0; i < n_tokens; ++i) {
-        batch.n_seq_id[i] = 1;
-        batch.seq_id[i][0] = 0;
-        // Diffusion models expose one logits row for every input position.
-        // Keep that layout explicit and index generation rows after the
-        // multimodal prefix below.
+    for (int32_t i = 0; i < active_generation_length; ++i) {
+        // Same-position D2F decoding only consumes generation logits. Avoid
+        // materializing a vocabulary row for every selected visual token.
+        batch.logits[input_prefix.total_length + i] = 1;
+    }
+}
+
+void fill_prefix_batch(
+        llama_batch & batch,
+        const prefix & input_prefix) {
+    initialize_batch_rows(batch, input_prefix.total_length);
+    std::copy(input_prefix.embeddings.begin(), input_prefix.embeddings.end(), batch.embd);
+    std::copy(input_prefix.positions.begin(), input_prefix.positions.end(), batch.pos);
+    batch.logits[input_prefix.total_length - 1] = 1;
+}
+
+void fill_generation_batch(
+        llama_batch & batch,
+        const prefix & input_prefix,
+        const std::vector<int32_t> & generation_tokens,
+        int32_t active_generation_length,
+        token_embedding_reader & token_embeddings,
+        int32_t n_embd) {
+    initialize_batch_rows(batch, active_generation_length);
+    for (int32_t i = 0; i < active_generation_length; ++i) {
+        const std::vector<float> & embedding = token_embeddings.get(generation_tokens[i]);
+        std::copy(
+                embedding.begin(),
+                embedding.end(),
+                batch.embd + static_cast<size_t>(i) * n_embd);
+        batch.pos[i] = input_prefix.generation_position + i;
         batch.logits[i] = 1;
     }
 }
 
+mtmd::context_ptr make_vision_context(
+        const params & p,
+        llama_model * model,
+        bool exact_tile) {
+    mtmd_context_params mtmd_params = mtmd_context_params_default();
+    mtmd_params.use_gpu = p.vision_gpu < 0 ? p.n_gpu_layers > 0 : p.vision_gpu != 0;
+    mtmd_params.print_timings = p.print_timings;
+    mtmd_params.lladao_exact_tile = exact_tile;
+    if (p.n_threads > 0) {
+        mtmd_params.n_threads = p.n_threads;
+    }
+
+    mtmd::context_ptr context(
+            mtmd_init_from_file(p.mmproj.c_str(), model, mtmd_params));
+    if (!context) {
+        throw std::runtime_error("failed to load LLaDA-o mmproj: " + p.mmproj);
+    }
+    if (!mtmd_support_vision(context.get())) {
+        throw std::runtime_error("mmproj does not support vision");
+    }
+    return context;
+}
+
+struct full_page_images {
+    std::vector<encoded_image> sources;
+    std::unique_ptr<encoded_image> overview;
+    int32_t width = 0;
+    int32_t height = 0;
+    int32_t dense_image_length = 0;
+};
+
+full_page_images encode_full_page(
+        const params & p,
+        llama_model * model,
+        int32_t n_embd) {
+    mtmd::context_ptr native_context = make_vision_context(p, model, false);
+    bitmap_ptr page = load_image(native_context.get(), p.image);
+
+    full_page_images result;
+    result.width  = static_cast<int32_t>(mtmd_bitmap_get_nx(page.get()));
+    result.height = static_cast<int32_t>(mtmd_bitmap_get_ny(page.get()));
+
+    if (p.full_page_overview) {
+        result.overview =
+                std::make_unique<encoded_image>(
+                        encode_bitmap(native_context.get(), page.get(), n_embd));
+        result.overview->overview = true;
+    }
+    native_context.reset();
+
+    const std::vector<tile_box> boxes =
+            full_page_tile_boxes(result.width, result.height, p.full_page_tile_size);
+    mtmd::context_ptr exact_context = make_vision_context(p, model, true);
+    result.sources.reserve(boxes.size());
+    llama_pos dense_position = 0;
+    for (size_t index = 0; index < boxes.size(); ++index) {
+        const bitmap_ptr tile = crop_bitmap(page.get(), boxes[index]);
+        encoded_image image = encode_bitmap(exact_context.get(), tile.get(), n_embd);
+        image.source_index = static_cast<int32_t>(index);
+        image.dense_position = dense_position;
+        dense_position += image.n_tokens + 2;
+        result.sources.push_back(std::move(image));
+        std::fprintf(
+                stderr,
+                "full_page tile=%zu box=[%" PRId32 ",%" PRId32 ",%" PRId32 ",%" PRId32
+                "] patches=%" PRId32 " dense_position=%" PRId32 "\n",
+                index,
+                boxes[index].x0,
+                boxes[index].y0,
+                boxes[index].x1,
+                boxes[index].y1,
+                result.sources.back().n_tokens,
+                result.sources.back().dense_position);
+    }
+
+    if (result.overview) {
+        result.overview->source_index = static_cast<int32_t>(result.sources.size());
+        result.overview->dense_position = dense_position;
+        dense_position += result.overview->n_tokens + 2;
+    }
+    result.dense_image_length = dense_position;
+    return result;
+}
+
+std::string trim_text(const std::string & text) {
+    auto is_space = [](unsigned char character) {
+        return std::isspace(character) != 0;
+    };
+    const auto begin = std::find_if_not(text.begin(), text.end(), is_space);
+    const auto end = std::find_if_not(text.rbegin(), text.rend(), is_space).base();
+    return begin < end ? std::string(begin, end) : std::string();
+}
+
+std::string full_page_generation_prompt(
+        const std::string & operation,
+        int32_t tile_count,
+        int32_t width,
+        int32_t height,
+        bool include_overview) {
+    const std::string page_size =
+            std::to_string(width) + "x" + std::to_string(height);
+    if (include_overview) {
+        return
+            "The first " + std::to_string(tile_count) +
+            " images are exact non-overlapping tiles from one " + page_size +
+            " webpage screenshot, ordered left-to-right and then top-to-bottom. "
+            "The final image is a resized overview of that same complete screenshot. "
+            "Treat all images as one page and use the final overview as the global "
+            "coordinate reference. " + operation +
+            " Return the action and bounding box with coordinates normalized to the "
+            "complete original screenshot in [0,1000].";
+    }
+    return
+        "The following " + std::to_string(tile_count) +
+        " images are non-overlapping tiles from one " + page_size +
+        " webpage screenshot, ordered left-to-right and then top-to-bottom. "
+        "Treat them as one complete page. " + operation +
+        " Return the action and bounding box with coordinates normalized to the "
+        "complete original screenshot in [0,1000].";
+}
+
+std::vector<llama_token> add_text_boundaries(
+        const llama_vocab * vocab,
+        const std::string & text) {
+    std::vector<llama_token> tokens;
+    tokens.push_back(llama_vocab_bos(vocab));
+    const std::vector<llama_token> content = tokenize(vocab, text, false, false);
+    tokens.insert(tokens.end(), content.begin(), content.end());
+    tokens.push_back(llama_vocab_eos(vocab));
+    return tokens;
+}
+
+int32_t selected_prefix_capacity(
+        const std::vector<encoded_image> & sources,
+        const encoded_image * overview,
+        int32_t topk,
+        size_t prompt_tokens) {
+    std::vector<int32_t> source_lengths;
+    source_lengths.reserve(sources.size());
+    for (const encoded_image & image : sources) {
+        source_lengths.push_back(image.n_tokens + 2);
+    }
+    std::sort(source_lengths.begin(), source_lengths.end(), std::greater<int32_t>());
+    if (topk > 0 && static_cast<size_t>(topk) < source_lengths.size()) {
+        source_lengths.resize(static_cast<size_t>(topk));
+    }
+
+    int64_t capacity = static_cast<int64_t>(prompt_tokens) + D2F_GENERATION_LENGTH;
+    for (int32_t length : source_lengths) {
+        capacity += length;
+    }
+    if (overview) {
+        capacity += overview->n_tokens + 2;
+    }
+    if (capacity > std::numeric_limits<int32_t>::max()) {
+        throw std::overflow_error("selected full-page prefix is too large");
+    }
+    return static_cast<int32_t>(capacity);
+}
+
 void print_layout(
         const prefix & input_prefix,
+        int32_t n_images,
         int32_t n_image_patches,
+        int32_t dense_image_length,
         size_t n_prompt_tokens,
         int32_t n_ctx) {
     std::fprintf(stderr,
             "LLaDA-o input layout:\n"
-            "  image split: %" PRId32 " tokens "
-            "(vision_start + %" PRId32 " patches + vision_end), shared RoPE position 0\n"
-            "  text split:  %zu tokens (BOS + GUI instruction + EOS), RoPE positions 1..%" PRId32 "\n"
+            "  image split: %" PRId32 " selected spans, %" PRId32 " resident tokens "
+            "(%" PRId32 " patches), dense layout %" PRId32 " tokens\n"
+            "  text split:  %zu tokens (BOS + GUI instruction + EOS), "
+            "RoPE positions %" PRId32 "..%" PRId32 "\n"
             "  D2F output:   %" PRId32 " masks, block length %" PRId32 ", RoPE positions %" PRId32 "..%" PRId32 "\n"
-            "  active max:   %" PRId32 " tokens, context capacity %" PRId32 "\n",
+            "  active max:   %" PRId32 " tokens, configured context limit %" PRId32 "\n",
+            n_images,
             input_prefix.image_length,
             n_image_patches,
+            dense_image_length,
             n_prompt_tokens,
+            input_prefix.generation_position - static_cast<llama_pos>(n_prompt_tokens),
             input_prefix.generation_position - 1,
             D2F_GENERATION_LENGTH,
             D2F_BLOCK_LENGTH,
@@ -463,182 +1024,681 @@ void print_layout(
             n_ctx);
 }
 
-int run(const params & p) {
-    ggml_backend_load_all();
-
-    llama_model_params model_params = llama_model_default_params();
-    model_params.n_gpu_layers = p.n_gpu_layers;
-    llama_model_ptr model(llama_model_load_from_file(p.model.c_str(), model_params));
-    if (!model) {
-        throw std::runtime_error("failed to load language model: " + p.model);
-    }
-    if (!llama_model_is_diffusion(model.get())) {
-        throw std::runtime_error("language GGUF is not marked as a diffusion model");
-    }
-
-    const llama_vocab * vocab = llama_model_get_vocab(model.get());
-    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
-    const int32_t n_embd = llama_model_n_embd_inp(model.get());
-    if (n_vocab <= 0 || n_embd <= 0) {
-        throw std::runtime_error("language model has invalid vocabulary or embedding width");
-    }
-
-    const llama_token bos = llama_vocab_bos(vocab);
-    const llama_token eos = llama_vocab_eos(vocab);
-    llama_token mask = llama_vocab_mask(vocab);
-    if (mask == LLAMA_TOKEN_NULL) {
-        mask = p.mask_token_id;
-    }
-    if (bos == LLAMA_TOKEN_NULL || eos == LLAMA_TOKEN_NULL || mask == LLAMA_TOKEN_NULL) {
-        throw std::runtime_error(
-                "model must provide BOS, EOS, and MASK tokens (or pass --mask-token-id)");
-    }
-    const llama_token vision_start = special_token(vocab, "<|vision_start|>");
-    const llama_token vision_end   = special_token(vocab, "<|vision_end|>");
-
-    mtmd_context_params mtmd_params = mtmd_context_params_default();
-    mtmd_params.use_gpu = p.n_gpu_layers > 0;
-    mtmd_params.print_timings = true;
-    if (p.n_threads > 0) {
-        mtmd_params.n_threads = p.n_threads;
-    }
-    mtmd::context_ptr mctx(mtmd_init_from_file(p.mmproj.c_str(), model.get(), mtmd_params));
-    if (!mctx) {
-        throw std::runtime_error("failed to load LLaDA-o mmproj: " + p.mmproj);
-    }
-    if (!mtmd_support_vision(mctx.get())) {
-        throw std::runtime_error("mmproj does not support vision");
-    }
-
-    const encoded_image image = encode_image(mctx.get(), p.image, n_embd);
-    std::vector<llama_token> prompt_tokens;
-    prompt_tokens.push_back(bos);
-    const std::vector<llama_token> instruction = tokenize(vocab, p.prompt, false, false);
-    prompt_tokens.insert(prompt_tokens.end(), instruction.begin(), instruction.end());
-    prompt_tokens.push_back(eos);
-
-    token_embedding_reader token_embeddings(p.model, n_embd, n_vocab);
-    const prefix input_prefix = build_prefix(
-            token_embeddings, image, prompt_tokens, vision_start, vision_end, n_embd);
-    const int32_t max_tokens = input_prefix.total_length + D2F_GENERATION_LENGTH;
-    if (max_tokens > p.n_ctx) {
-        throw std::runtime_error(
-                "input needs " + std::to_string(max_tokens) +
-                " tokens but --ctx-size is " + std::to_string(p.n_ctx));
-    }
-    print_layout(input_prefix, image.n_tokens, prompt_tokens.size(), p.n_ctx);
-    if (p.preprocess_only) {
-        return 0;
-    }
-
-    llama_context_params context_params = llama_context_default_params();
-    context_params.n_ctx = p.n_ctx;
-    context_params.n_batch = max_tokens;
-    context_params.n_ubatch = max_tokens;
-    context_params.no_perf = false;
-    if (p.n_threads > 0) {
-        context_params.n_threads = p.n_threads;
-        context_params.n_threads_batch = p.n_threads;
-    }
-    llama_context_ptr context(llama_init_from_model(model.get(), context_params));
-    if (!context) {
-        throw std::runtime_error("failed to create language context");
-    }
-
-    llama_adapter_lora_ptr lora;
-    if (!p.lora.empty()) {
-        lora.reset(llama_adapter_lora_init(model.get(), p.lora.c_str()));
-        if (!lora) {
-            throw std::runtime_error("failed to load LoRA: " + p.lora);
-        }
-        llama_adapter_lora * adapters[] = { lora.get() };
-        float scales[] = { 1.0f };
-        if (llama_set_adapters_lora(context.get(), adapters, 1, scales) != 0) {
-            throw std::runtime_error("failed to apply LoRA");
-        }
-    }
-
-    llama_set_causal_attn(context.get(), false);
-    llama_set_d2f_attention(
-            context.get(), input_prefix.image_length, input_prefix.total_length, D2F_BLOCK_LENGTH);
-
-    diffusion_d2f_scheduler_params scheduler_params;
-    scheduler_params.generation_length = D2F_GENERATION_LENGTH;
-    scheduler_params.block_length = D2F_BLOCK_LENGTH;
-    scheduler_params.max_iterations = p.max_iterations;
-    scheduler_params.mask_token_id = mask;
-    scheduler_params.initial_token_id = bos;
-    scheduler_params.eos_token_id = eos;
-    diffusion_d2f_scheduler scheduler(scheduler_params);
-
-    batch_owner owned_batch(max_tokens, n_embd);
-    while (!scheduler.done()) {
-        const diffusion_d2f_step step = scheduler.prepare_step();
-        if (step.done) {
-            break;
-        }
-
-        llama_memory_clear(llama_get_memory(context.get()), true);
-        llama_batch & batch = owned_batch.get();
-        fill_batch(
-                batch,
-                input_prefix,
-                scheduler.tokens(),
-                step.active_end,
-                token_embeddings,
-                n_embd);
-        const int32_t decode_result = llama_decode(context.get(), batch);
-        if (decode_result != 0) {
-            throw std::runtime_error("llama_decode failed with code " + std::to_string(decode_result));
-        }
-
-        const float * logits = llama_get_logits(context.get());
-        if (!logits) {
-            throw std::runtime_error("language model returned no generation logits");
-        }
-        const std::vector<diffusion_d2f_candidate> candidates =
-                diffusion_d2f_argmax_candidates(
-                        logits,
-                        input_prefix.total_length + step.active_end,
-                        n_vocab,
-                        0,
-                        input_prefix.total_length,
-                        D2F_GENERATION_LENGTH,
-                        false);
-        const std::vector<diffusion_d2f_update> updates = scheduler.apply_candidates(candidates);
-        std::fprintf(stderr,
-                "D2F iteration %" PRId32 ": active [%" PRId32 ", %" PRId32
-                "), blocks %" PRId32 ", updates %zu\n",
-                step.iteration,
-                step.active_start,
-                step.active_end,
-                step.blocks_added,
-                updates.size());
-    }
-
-    const std::vector<int32_t> & generated = scheduler.tokens();
-    const int32_t output_length = scheduler.output_length();
-    for (int32_t i = 0; i < output_length; ++i) {
-        if (generated[i] == mask) {
-            throw std::runtime_error("D2F stopped with unresolved mask tokens");
-        }
-        const std::string piece = token_piece(vocab, generated[i]);
-        std::fwrite(piece.data(), 1, piece.size(), stdout);
-    }
-    std::fputc('\n', stdout);
-    llama_perf_context_print(context.get());
-    return 0;
-}
-
 } // namespace
 
-int main(int argc, char ** argv) {
+namespace lladao {
+
+struct d2f_engine::impl {
+    params base;
+    llama_model_ptr model;
+    const llama_vocab * vocab = nullptr;
+    int32_t n_vocab = 0;
+    int32_t n_embd = 0;
+    llama_token bos = LLAMA_TOKEN_NULL;
+    llama_token eos = LLAMA_TOKEN_NULL;
+    llama_token mask = LLAMA_TOKEN_NULL;
+    llama_token vision_start = LLAMA_TOKEN_NULL;
+    llama_token vision_end = LLAMA_TOKEN_NULL;
+    std::unique_ptr<token_embedding_reader> token_embeddings;
+    mtmd::context_ptr native_vision;
+    llama_adapter_lora_ptr adapter;
+    std::string adapter_path;
+    float adapter_scale = 1.0f;
+    llama_context_ptr context;
+    std::unique_ptr<batch_owner> owned_batch;
+    int32_t batch_capacity = 0;
+    int32_t output_capacity = 0;
+    std::atomic<bool> cancel_requested { false };
+    std::atomic<bool> active { false };
+    std::mutex operation_mutex;
+
+    explicit impl(const d2f_engine_params & p) {
+        if (p.model_path.empty() || p.mmproj_path.empty()) {
+            throw std::invalid_argument("model and mmproj paths must not be empty");
+        }
+        if (p.context_size <= 0 || p.threads < 0 || p.max_iterations <= 0) {
+            throw std::invalid_argument("context size, threads, and max iterations must be valid");
+        }
+        if (p.yarn_factor < 1.0f || p.yarn_original_context <= 0) {
+            throw std::invalid_argument("YaRN factor and original context must be valid");
+        }
+        if (!std::isfinite(p.adapter_scale)) {
+            throw std::invalid_argument("adapter scale must be finite");
+        }
+
+        base.model = p.model_path;
+        base.mmproj = p.mmproj_path;
+        base.n_ctx = p.context_size;
+        base.n_gpu_layers = p.gpu_layers;
+        base.n_threads = p.threads;
+        base.max_iterations = p.max_iterations;
+        base.mask_token_id = p.mask_token_id;
+        base.yarn_orig_ctx = p.yarn_original_context;
+        base.yarn_factor = p.yarn_factor;
+        base.vision_gpu = p.vision_gpu;
+        base.prefix_cache = p.prefix_cache;
+        base.print_timings = p.print_timings;
+
+        ggml_backend_load_all();
+
+        llama_model_params model_params = llama_model_default_params();
+        model_params.n_gpu_layers = base.n_gpu_layers;
+        model.reset(llama_model_load_from_file(base.model.c_str(), model_params));
+        if (!model) {
+            throw std::runtime_error("failed to load language model: " + base.model);
+        }
+        if (!llama_model_is_diffusion(model.get())) {
+            throw std::runtime_error("language GGUF is not marked as a diffusion model");
+        }
+
+        vocab = llama_model_get_vocab(model.get());
+        n_vocab = llama_vocab_n_tokens(vocab);
+        n_embd = llama_model_n_embd_inp(model.get());
+        if (n_vocab <= 0 || n_embd <= 0) {
+            throw std::runtime_error("language model has invalid vocabulary or embedding width");
+        }
+
+        bos = llama_vocab_bos(vocab);
+        eos = llama_vocab_eos(vocab);
+        mask = llama_vocab_mask(vocab);
+        if (mask == LLAMA_TOKEN_NULL) {
+            mask = base.mask_token_id;
+        }
+        if (bos == LLAMA_TOKEN_NULL || eos == LLAMA_TOKEN_NULL || mask == LLAMA_TOKEN_NULL) {
+            throw std::runtime_error("model must provide BOS, EOS, and MASK tokens");
+        }
+        vision_start = special_token(vocab, "<|vision_start|>");
+        vision_end = special_token(vocab, "<|vision_end|>");
+
+        token_embeddings = std::make_unique<token_embedding_reader>(base.model, n_embd, n_vocab);
+        native_vision = make_vision_context(base, model.get(), false);
+
+        if (!p.adapter_path.empty()) {
+            set_adapter_locked(p.adapter_path, p.adapter_scale);
+        }
+    }
+
+    void apply_adapter() {
+        if (!context) {
+            return;
+        }
+        if (!adapter) {
+            if (llama_set_adapters_lora(context.get(), nullptr, 0, nullptr) != 0) {
+                throw std::runtime_error("failed to clear LoRA adapter");
+            }
+            return;
+        }
+        llama_adapter_lora * adapters[] = { adapter.get() };
+        float scales[] = { adapter_scale };
+        if (llama_set_adapters_lora(context.get(), adapters, 1, scales) != 0) {
+            throw std::runtime_error("failed to apply LoRA adapter");
+        }
+    }
+
+    void set_adapter_locked(const std::string & path, float scale) {
+        if (path.empty()) {
+            clear_adapter_locked();
+            return;
+        }
+        if (!std::isfinite(scale)) {
+            throw std::invalid_argument("adapter scale must be finite");
+        }
+        if (adapter && adapter_path == path && adapter_scale == scale) {
+            return;
+        }
+
+        llama_adapter_lora_ptr replacement(llama_adapter_lora_init(model.get(), path.c_str()));
+        if (!replacement) {
+            throw std::runtime_error("failed to load LoRA: " + path);
+        }
+        if (context) {
+            llama_adapter_lora * adapters[] = { replacement.get() };
+            float scales[] = { scale };
+            if (llama_set_adapters_lora(context.get(), adapters, 1, scales) != 0) {
+                throw std::runtime_error("failed to apply LoRA adapter");
+            }
+        }
+        adapter = std::move(replacement);
+        adapter_path = path;
+        adapter_scale = scale;
+    }
+
+    void clear_adapter_locked() {
+        if (context && llama_set_adapters_lora(context.get(), nullptr, 0, nullptr) != 0) {
+            throw std::runtime_error("failed to clear LoRA adapter");
+        }
+        adapter.reset();
+        adapter_path.clear();
+        adapter_scale = 1.0f;
+    }
+
+    void ensure_context(int32_t required_batch, int32_t required_outputs) {
+        if (context && required_batch <= batch_capacity && required_outputs <= output_capacity) {
+            return;
+        }
+
+        owned_batch.reset();
+        context.reset();
+
+        llama_context_params context_params = llama_context_default_params();
+        // The engine-level context size is an upper bound. Allocating a KV cache for
+        // that entire limit (16K by default) wastes several GiB on mobile when the
+        // current request contains only a few thousand resident tokens. The cache
+        // stores one entry per submitted token, so size it to this request instead;
+        // sparse multimodal RoPE positions do not require empty cache entries.
+        context_params.n_ctx = required_batch;
+        context_params.n_batch = required_batch;
+        context_params.n_ubatch = required_batch;
+        context_params.n_outputs_max = required_outputs;
+        context_params.no_perf = false;
+        if (base.yarn_factor > 1.0f) {
+            context_params.rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_YARN;
+            context_params.rope_freq_scale = 1.0f / base.yarn_factor;
+            context_params.yarn_orig_ctx = static_cast<uint32_t>(base.yarn_orig_ctx);
+        }
+        if (base.n_threads > 0) {
+            context_params.n_threads = base.n_threads;
+            context_params.n_threads_batch = base.n_threads;
+        }
+
+        context.reset(llama_init_from_model(model.get(), context_params));
+        if (!context) {
+            throw std::runtime_error("failed to create language context");
+        }
+        std::fprintf(
+                stderr,
+                "D2F context resident_capacity=%" PRIu32 " request_tokens=%" PRId32
+                " configured_limit=%" PRId32 "\n",
+                llama_n_ctx(context.get()),
+                required_batch,
+                base.n_ctx);
+        llama_set_causal_attn(context.get(), false);
+        apply_adapter();
+
+        owned_batch = std::make_unique<batch_owner>(required_batch, n_embd);
+        batch_capacity = required_batch;
+        output_capacity = required_outputs;
+    }
+
+    d2f_result generate_locked(const d2f_request & request) {
+        params p = base;
+        p.image = request.image_path;
+        p.prompt = request.prompt;
+        p.retrieval_query = request.retrieval_query;
+        p.full_page_tile_size = request.full_page_tile_size;
+        p.tile_retrieval_topk = request.tile_retrieval_topk;
+        p.tile_retrieval_mask_rounds = request.tile_retrieval_mask_rounds;
+        p.full_page_tiles = request.full_page_tiles || request.tile_retrieval_topk > 0;
+        p.full_page_overview = request.full_page_overview;
+        p.preprocess_only = request.preprocess_only;
+
+        if (p.image.empty() || p.prompt.empty()) {
+            throw std::invalid_argument("image path and prompt must not be empty");
+        }
+        if (p.full_page_tile_size <= 0 || p.full_page_tile_size > 980) {
+            throw std::invalid_argument("full-page tile size must be in [1, 980]");
+        }
+        if (p.tile_retrieval_topk < 0 || p.tile_retrieval_mask_rounds <= 0) {
+            throw std::invalid_argument("retrieval Top-K and mask rounds must be valid");
+        }
+
+        const std::string operation = trim_text(p.prompt);
+        const std::string retrieval_query =
+                trim_text(p.retrieval_query.empty() ? operation : p.retrieval_query);
+        if (operation.empty() || retrieval_query.empty()) {
+            throw std::invalid_argument("GUI operation and retrieval query must not be blank");
+        }
+
+        std::vector<encoded_image> native_images;
+        full_page_images page;
+        std::vector<const encoded_image *> selected_images;
+        std::vector<llama_token> prompt_tokens;
+        llama_pos prompt_position = 1;
+        int32_t dense_image_length = 0;
+        int32_t max_work_tokens = 0;
+        std::vector<llama_token> retrieval_query_tokens;
+
+        if (p.full_page_tiles) {
+            native_vision.reset();
+            page = encode_full_page(p, model.get(), n_embd);
+            if (page.sources.empty()) {
+                throw std::runtime_error("full-page tiling produced no source images");
+            }
+            const std::string generation_prompt = full_page_generation_prompt(
+                    operation,
+                    static_cast<int32_t>(page.sources.size()),
+                    page.width,
+                    page.height,
+                    page.overview != nullptr);
+            prompt_tokens = add_text_boundaries(vocab, generation_prompt);
+            prompt_position = page.dense_image_length;
+            dense_image_length = page.dense_image_length;
+            max_work_tokens = selected_prefix_capacity(
+                    page.sources,
+                    page.overview.get(),
+                    p.tile_retrieval_topk,
+                    prompt_tokens.size());
+
+            if (p.tile_retrieval_topk > 0) {
+                retrieval_query_tokens = add_text_boundaries(vocab, retrieval_query);
+                int32_t maximum_score_document = 0;
+                for (const encoded_image & source : page.sources) {
+                    maximum_score_document = std::max(
+                            maximum_score_document,
+                            source.n_tokens + 2 +
+                                    static_cast<int32_t>(retrieval_query_tokens.size()));
+                }
+                max_work_tokens = std::max(max_work_tokens, maximum_score_document);
+            } else {
+                for (const encoded_image & source : page.sources) {
+                    selected_images.push_back(&source);
+                }
+            }
+            if (page.overview && p.tile_retrieval_topk == 0) {
+                selected_images.push_back(page.overview.get());
+            }
+        } else {
+            prompt_tokens = add_text_boundaries(vocab, operation);
+            if (!native_vision) {
+                native_vision = make_vision_context(base, model.get(), false);
+            }
+            native_images.push_back(encode_image(native_vision.get(), p.image, n_embd));
+            native_images.back().dense_position = 0;
+            selected_images.push_back(&native_images.back());
+            dense_image_length = native_images.back().n_tokens + 2;
+            max_work_tokens =
+                    dense_image_length +
+                    static_cast<int32_t>(prompt_tokens.size()) +
+                    D2F_GENERATION_LENGTH;
+        }
+
+        if (max_work_tokens > p.n_ctx) {
+            throw std::runtime_error(
+                    "the largest scoring or generation batch needs " +
+                    std::to_string(max_work_tokens) +
+                    " tokens but context size is " + std::to_string(p.n_ctx));
+        }
+
+        d2f_result result;
+        if (p.preprocess_only) {
+            if (selected_images.empty()) {
+                const size_t count = std::min(
+                        static_cast<size_t>(p.tile_retrieval_topk),
+                        page.sources.size());
+                for (size_t i = 0; i < count; ++i) {
+                    selected_images.push_back(&page.sources[i]);
+                }
+                if (page.overview) {
+                    selected_images.push_back(page.overview.get());
+                }
+                std::fprintf(
+                        stderr,
+                        "preprocess-only: retrieval scoring skipped; showing a %zu-tile capacity layout\n",
+                        count);
+            }
+            const prefix input_prefix = build_prefix(
+                    *token_embeddings,
+                    selected_images,
+                    prompt_tokens,
+                    vision_start,
+                    vision_end,
+                    prompt_position,
+                    n_embd);
+            int32_t patch_count = 0;
+            for (const encoded_image * image : selected_images) {
+                patch_count += image->n_tokens;
+            }
+            print_layout(
+                    input_prefix,
+                    static_cast<int32_t>(selected_images.size()),
+                    patch_count,
+                    dense_image_length,
+                    prompt_tokens.size(),
+                    p.n_ctx);
+            result.image_tokens = input_prefix.image_length;
+            result.input_tokens = input_prefix.total_length;
+            result.preprocessed_only = true;
+            return result;
+        }
+
+        const int32_t required_outputs = std::max<int32_t>(
+                D2F_GENERATION_LENGTH,
+                retrieval_query_tokens.empty()
+                        ? 0
+                        : static_cast<int32_t>(retrieval_query_tokens.size()));
+        ensure_context(max_work_tokens, required_outputs);
+
+        if (p.tile_retrieval_topk > 0) {
+            llama_set_d2f_attention(context.get(), -1, -1, -1, -1, 0);
+            const retrieval_result retrieval = retrieve_image_tiles(
+                    context.get(),
+                    *owned_batch,
+                    *token_embeddings,
+                    page.sources,
+                    retrieval_query_tokens,
+                    vision_start,
+                    vision_end,
+                    mask,
+                    prompt_position,
+                    p.tile_retrieval_topk,
+                    p.tile_retrieval_mask_rounds,
+                    n_embd,
+                    n_vocab);
+
+            for (int32_t source_index : retrieval.selected_source_indices) {
+                const auto found = std::find_if(
+                        page.sources.begin(),
+                        page.sources.end(),
+                        [source_index](const encoded_image & image) {
+                            return image.source_index == source_index;
+                        });
+                if (found == page.sources.end()) {
+                    throw std::logic_error("retrieval selected an unknown source tile");
+                }
+                selected_images.push_back(&*found);
+            }
+            if (page.overview) {
+                selected_images.push_back(page.overview.get());
+            }
+
+            std::fprintf(stderr, "tile_retrieval selected_sources=[");
+            for (size_t i = 0; i < retrieval.selected_source_indices.size(); ++i) {
+                std::fprintf(
+                        stderr,
+                        "%s%" PRId32,
+                        i == 0 ? "" : ",",
+                        retrieval.selected_source_indices[i]);
+            }
+            std::fprintf(
+                    stderr,
+                    "] overview=%s latency=%.6f query=%s\n",
+                    page.overview ? "true" : "false",
+                    retrieval.latency_seconds,
+                    retrieval_query.c_str());
+        }
+
+        if (cancel_requested.load(std::memory_order_relaxed)) {
+            result.cancelled = true;
+            return result;
+        }
+
+        const prefix input_prefix = build_prefix(
+                *token_embeddings,
+                selected_images,
+                prompt_tokens,
+                vision_start,
+                vision_end,
+                prompt_position,
+                n_embd);
+        const int32_t max_tokens = input_prefix.total_length + D2F_GENERATION_LENGTH;
+        if (max_tokens > p.n_ctx || max_tokens > max_work_tokens) {
+            throw std::logic_error("selected prefix exceeds its validated capacity");
+        }
+        int32_t selected_patches = 0;
+        for (const encoded_image * image : selected_images) {
+            selected_patches += image->n_tokens;
+        }
+        print_layout(
+                input_prefix,
+                static_cast<int32_t>(selected_images.size()),
+                selected_patches,
+                dense_image_length,
+                prompt_tokens.size(),
+                p.n_ctx);
+        const int64_t observed_max_position =
+                static_cast<int64_t>(input_prefix.generation_position) +
+                D2F_GENERATION_LENGTH - 1;
+        const int64_t declared_max_position = static_cast<int64_t>(
+                static_cast<double>(p.yarn_orig_ctx) * p.yarn_factor);
+        if (observed_max_position >= declared_max_position) {
+            std::fprintf(
+                    stderr,
+                    "warning: maximum RoPE position %" PRId64
+                    " reaches or exceeds the declared range [0, %" PRId64
+                    "); this is unscaled or beyond-factor extrapolation\n",
+                    observed_max_position,
+                    declared_max_position);
+        }
+        if (p.full_page_tiles) {
+            std::fprintf(
+                    stderr,
+                    "tile_retrieval resident_tokens=%" PRId32 " dense_tokens=%" PRId32
+                    " image_token_ratio=%.6f prefix_token_ratio=%.6f yarn_factor=%.3f\n",
+                    input_prefix.image_length,
+                    dense_image_length,
+                    static_cast<double>(input_prefix.image_length) / dense_image_length,
+                    static_cast<double>(input_prefix.total_length) /
+                            (dense_image_length + prompt_tokens.size()),
+                    p.yarn_factor);
+        }
+
+        result.image_tokens = input_prefix.image_length;
+        result.input_tokens = input_prefix.total_length;
+        llama_set_d2f_attention(
+                context.get(),
+                input_prefix.image_length,
+                input_prefix.total_length,
+                prompt_position,
+                input_prefix.generation_position,
+                D2F_BLOCK_LENGTH);
+
+        diffusion_d2f_scheduler_params scheduler_params;
+        scheduler_params.generation_length = D2F_GENERATION_LENGTH;
+        scheduler_params.block_length = D2F_BLOCK_LENGTH;
+        scheduler_params.max_iterations = p.max_iterations;
+        scheduler_params.mask_token_id = mask;
+        scheduler_params.initial_token_id = bos;
+        scheduler_params.eos_token_id = eos;
+        diffusion_d2f_scheduler scheduler(scheduler_params);
+
+        llama_perf_context_reset(context.get());
+        const auto generation_started = std::chrono::steady_clock::now();
+        llama_memory_clear(llama_get_memory(context.get()), true);
+        if (p.prefix_cache) {
+            const auto prefill_started = std::chrono::steady_clock::now();
+            llama_batch & batch = owned_batch->get();
+            fill_prefix_batch(batch, input_prefix);
+            const int32_t decode_result = llama_decode(context.get(), batch);
+            if (decode_result != 0) {
+                throw std::runtime_error("prefix prefill llama_decode failed with code " + std::to_string(decode_result));
+            }
+            llama_synchronize(context.get());
+            const auto prefill_finished = std::chrono::steady_clock::now();
+            std::fprintf(
+                    stderr,
+                    "D2F prefix_cache=enabled cached_tokens=%" PRId32 " prefill_seconds=%.6f\n",
+                    input_prefix.total_length,
+                    std::chrono::duration<double>(prefill_finished - prefill_started).count());
+        } else {
+            std::fprintf(stderr, "D2F prefix_cache=disabled\n");
+        }
+        while (!scheduler.done()) {
+            if (cancel_requested.load(std::memory_order_relaxed)) {
+                result.cancelled = true;
+                break;
+            }
+            const diffusion_d2f_step step = scheduler.prepare_step();
+            if (step.done) {
+                break;
+            }
+            const auto iteration_started = std::chrono::steady_clock::now();
+
+            llama_batch & batch = owned_batch->get();
+            if (p.prefix_cache) {
+                if (!llama_memory_seq_rm(
+                            llama_get_memory(context.get()),
+                            0,
+                            input_prefix.generation_position,
+                            -1)) {
+                    throw std::runtime_error("failed to discard the dynamic D2F cache range");
+                }
+                fill_generation_batch(
+                        batch,
+                        input_prefix,
+                        scheduler.tokens(),
+                        step.active_end,
+                        *token_embeddings,
+                        n_embd);
+            } else {
+                llama_memory_clear(llama_get_memory(context.get()), true);
+                fill_batch(
+                        batch,
+                        input_prefix,
+                        scheduler.tokens(),
+                        step.active_end,
+                        *token_embeddings,
+                        n_embd);
+            }
+            const int32_t decode_result = llama_decode(context.get(), batch);
+            if (decode_result != 0) {
+                throw std::runtime_error("llama_decode failed with code " + std::to_string(decode_result));
+            }
+
+            const float * logits = llama_get_logits(context.get());
+            if (!logits) {
+                throw std::runtime_error("language model returned no generation logits");
+            }
+            const std::vector<diffusion_d2f_candidate> candidates =
+                    diffusion_d2f_argmax_candidates(
+                            logits,
+                            step.active_end,
+                            n_vocab,
+                            p.prefix_cache ? 0 : input_prefix.total_length,
+                            p.prefix_cache ? 0 : input_prefix.total_length,
+                            D2F_GENERATION_LENGTH,
+                            false);
+            const std::vector<diffusion_d2f_update> updates = scheduler.apply_candidates(candidates);
+            const auto iteration_finished = std::chrono::steady_clock::now();
+            ++result.iterations;
+            std::fprintf(stderr,
+                    "D2F iteration %" PRId32 ": active [%" PRId32 ", %" PRId32
+                    "), blocks %" PRId32 ", updates %zu, decode_tokens=%" PRId32
+                    ", seconds=%.6f\n",
+                    step.iteration,
+                    step.active_start,
+                    step.active_end,
+                    step.blocks_added,
+                    updates.size(),
+                    batch.n_tokens,
+                    std::chrono::duration<double>(iteration_finished - iteration_started).count());
+        }
+
+        const auto generation_finished = std::chrono::steady_clock::now();
+        result.generation_seconds = std::chrono::duration<double>(
+                generation_finished - generation_started).count();
+        std::fprintf(stderr, "D2F generation_seconds=%.6f\n", result.generation_seconds);
+        if (base.print_timings) {
+            llama_perf_context_print(context.get());
+        }
+        if (result.cancelled) {
+            return result;
+        }
+
+        const std::vector<int32_t> & generated = scheduler.tokens();
+        const int32_t output_length = scheduler.output_length();
+        for (int32_t i = 0; i < output_length; ++i) {
+            if (generated[i] == mask) {
+                throw std::runtime_error("D2F stopped with unresolved mask tokens");
+            }
+            result.text += token_piece(vocab, generated[i]);
+        }
+        return result;
+    }
+};
+
+d2f_engine::d2f_engine(const d2f_engine_params & params) : impl_(std::make_unique<impl>(params)) {}
+
+d2f_engine::~d2f_engine() = default;
+
+d2f_engine::d2f_engine(d2f_engine &&) noexcept = default;
+
+d2f_engine & d2f_engine::operator=(d2f_engine &&) noexcept = default;
+
+d2f_result d2f_engine::generate(const d2f_request & request) {
+    if (!impl_) {
+        throw std::logic_error("LLaDA-o engine is not initialized");
+    }
+    std::lock_guard<std::mutex> lock(impl_->operation_mutex);
+    impl_->cancel_requested.store(false, std::memory_order_relaxed);
+    impl_->active.store(true, std::memory_order_release);
+    struct active_guard {
+        std::atomic<bool> & active;
+        ~active_guard() {
+            active.store(false, std::memory_order_release);
+        }
+    } guard { impl_->active };
+    return impl_->generate_locked(request);
+}
+
+void d2f_engine::set_adapter(const std::string & path, float scale) {
+    if (!impl_) {
+        throw std::logic_error("LLaDA-o engine is not initialized");
+    }
+    std::lock_guard<std::mutex> lock(impl_->operation_mutex);
+    impl_->set_adapter_locked(path, scale);
+}
+
+void d2f_engine::clear_adapter() {
+    if (!impl_) {
+        throw std::logic_error("LLaDA-o engine is not initialized");
+    }
+    std::lock_guard<std::mutex> lock(impl_->operation_mutex);
+    impl_->clear_adapter_locked();
+}
+
+void d2f_engine::cancel() noexcept {
+    if (impl_) {
+        impl_->cancel_requested.store(true, std::memory_order_relaxed);
+    }
+}
+
+bool d2f_engine::busy() const noexcept {
+    return impl_ && impl_->active.load(std::memory_order_acquire);
+}
+
+int cli_main(int argc, char ** argv) {
     try {
         const params p = parse_args(argc, argv);
-        return run(p);
+        d2f_engine_params engine_params;
+        engine_params.model_path = p.model;
+        engine_params.mmproj_path = p.mmproj;
+        engine_params.adapter_path = p.lora;
+        engine_params.context_size = p.n_ctx;
+        engine_params.gpu_layers = p.n_gpu_layers;
+        engine_params.threads = p.n_threads;
+        engine_params.max_iterations = p.max_iterations;
+        engine_params.mask_token_id = p.mask_token_id;
+        engine_params.yarn_original_context = p.yarn_orig_ctx;
+        engine_params.yarn_factor = p.yarn_factor;
+        engine_params.vision_gpu = p.vision_gpu;
+        engine_params.prefix_cache = p.prefix_cache;
+
+        d2f_request request;
+        request.image_path = p.image;
+        request.prompt = p.prompt;
+        request.retrieval_query = p.retrieval_query;
+        request.full_page_tile_size = p.full_page_tile_size;
+        request.tile_retrieval_topk = p.tile_retrieval_topk;
+        request.tile_retrieval_mask_rounds = p.tile_retrieval_mask_rounds;
+        request.full_page_tiles = p.full_page_tiles;
+        request.full_page_overview = p.full_page_overview;
+        request.preprocess_only = p.preprocess_only;
+
+        d2f_engine engine(engine_params);
+        const d2f_result result = engine.generate(request);
+        if (result.cancelled) {
+            return 130;
+        }
+        if (!result.preprocessed_only) {
+            std::fwrite(result.text.data(), 1, result.text.size(), stdout);
+            std::fputc('\n', stdout);
+        }
+        return 0;
     } catch (const std::exception & error) {
         std::fprintf(stderr, "error: %s\n", error.what());
         print_usage(argv[0]);
         return 1;
     }
 }
+
+} // namespace lladao

@@ -946,23 +946,71 @@ clip_image_size mtmd_lladao_image_size(const clip_image_size & input_size) {
     return output_size;
 }
 
+clip_image_size mtmd_lladao_exact_tile_size(const clip_image_size & input_size) {
+    constexpr int image_max_edge = 980;
+    constexpr int patch_size     = 14;
+
+    GGML_ASSERT(input_size.width > 0 && input_size.height > 0);
+    GGML_ASSERT(input_size.width <= image_max_edge && input_size.height <= image_max_edge);
+
+    return {
+        (input_size.width  + patch_size - 1) / patch_size * patch_size,
+        (input_size.height + patch_size - 1) / patch_size * patch_size,
+    };
+}
+
+clip_image_f32 mtmd_lladao_exact_tile_image(
+        const clip_image_u8 & img,
+        const float image_mean[3],
+        const float image_std[3]) {
+    const clip_image_size input_size  = img.get_size();
+    const clip_image_size output_size = mtmd_lladao_exact_tile_size(input_size);
+
+    clip_image_f32 output;
+    output.set_size(output_size, img.is_placeholder(), false);
+    if (img.is_placeholder()) {
+        return output;
+    }
+
+    std::vector<float> pixels(static_cast<size_t>(output_size.width) * output_size.height * 3, 0.0f);
+    const std::vector<uint8_t> & input_pixels = img.get_ro_buf();
+    for (int y = 0; y < input_size.height; y++) {
+        for (int x = 0; x < input_size.width; x++) {
+            const size_t input_offset  = (static_cast<size_t>(y) * input_size.width + x) * 3;
+            const size_t output_offset = (static_cast<size_t>(y) * output_size.width + x) * 3;
+            for (int c = 0; c < 3; c++) {
+                pixels[output_offset + c] =
+                    (static_cast<float>(input_pixels[input_offset + c]) / 255.0f - image_mean[c]) / image_std[c];
+            }
+        }
+    }
+    output.cpy_buf(pixels);
+    return output;
+}
+
 std::vector<int32_t> mtmd_lladao_position_ids(int patch_rows, int patch_cols) {
-    constexpr int bucket_side = 70;
+    constexpr int position_stride = 70;
 
     GGML_ASSERT(patch_rows > 0 && patch_cols > 0);
+    GGML_ASSERT(patch_rows <= position_stride && patch_cols <= position_stride);
 
     std::vector<int32_t> positions(patch_rows * patch_cols);
     for (int row = 0; row < patch_rows; row++) {
-        const int bucket_row = bucket_side * row / patch_rows;
         for (int col = 0; col < patch_cols; col++) {
-            const int bucket_col              = bucket_side * col / patch_cols;
-            positions[row * patch_cols + col] = bucket_row * bucket_side + bucket_col;
+            positions[row * patch_cols + col] = row * position_stride + col;
         }
     }
     return positions;
 }
 
 mtmd_image_preproc_out mtmd_image_preprocessor_lladao::preprocess(const clip_image_u8 & img) {
+    if (exact_tile) {
+        clip_image_f32 tile = mtmd_lladao_exact_tile_image(img, hparams.image_mean, hparams.image_std);
+        mtmd_image_preproc_out output;
+        output.append(hparams, tile, false);
+        return output;
+    }
+
     clip_image_u8 resized_image;
     img_tool::resize(img, resized_image, mtmd_lladao_image_size(img.get_size()), RESIZE_ALGO_BICUBIC_PILLOW, PAD_NONE);
 

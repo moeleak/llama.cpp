@@ -248,6 +248,7 @@ mtmd_context_params mtmd_context_params_default() {
         /* warmup            */ true,
         /* image_min_tokens  */ -1,
         /* image_max_tokens  */ -1,
+        /* lladao_exact_tile */ false,
         /* cb_eval           */ nullptr,
         /* cb_eval_user_data */ nullptr,
         /* batch_max_tokens  */ 1024,
@@ -294,6 +295,7 @@ struct mtmd_context {
 
     std::unique_ptr<mtmd_audio_preprocessor> audio_preproc;
     std::unique_ptr<mtmd_image_preprocessor> image_preproc;
+    bool lladao_exact_tile;
 
     // batching
     int32_t batch_max_tokens;
@@ -309,6 +311,7 @@ struct mtmd_context {
         media_marker    (ctx_params.media_marker),
         n_embd_text     (text_model ? llama_model_n_embd_inp(text_model) : -1),
         vocab           (text_model ? llama_model_get_vocab(text_model) : nullptr),
+        lladao_exact_tile(ctx_params.lladao_exact_tile),
         batch_max_tokens(ctx_params.batch_max_tokens)
     {
         if (ctx_params.image_marker != nullptr) {
@@ -397,7 +400,7 @@ struct mtmd_context {
                 {
                     img_beg = "<|vision_start|>";
                     img_end = "<|vision_end|>";
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_lladao>(ctx_v);
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_lladao>(ctx_v, lladao_exact_tile);
                 } break;
             case PROJECTOR_TYPE_MLP:
             case PROJECTOR_TYPE_MLP_NORM:

@@ -2065,8 +2065,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         case LLM_ARCH_MODERN_BERT:
         case LLM_ARCH_GEMMA_EMBEDDING:
         case LLM_ARCH_DREAM:
-        case LLM_ARCH_LLADA:
-        case LLM_ARCH_LLADA_MOE:
         case LLM_ARCH_RND1:
             {
                 res = nullptr;

@@ -1188,26 +1188,36 @@ void llama_context::set_causal_attn(bool value) {
 void llama_context::set_d2f_attention(
         int32_t image_prefix_length,
         int32_t prefix_length,
+        int32_t prompt_position,
+        int32_t generation_position,
         int32_t block_size) {
     if (image_prefix_length < 0 ||
         prefix_length < image_prefix_length ||
+        prompt_position < 0 ||
+        generation_position < prompt_position ||
         block_size <= 0) {
         image_prefix_length = -1;
         prefix_length = -1;
+        prompt_position = -1;
+        generation_position = -1;
         block_size = 0;
     }
 
-    LLAMA_LOG_DEBUG("%s: image_prefix_length = %d, prefix_length = %d, block_size = %d\n",
-            __func__, image_prefix_length, prefix_length, block_size);
+    LLAMA_LOG_DEBUG("%s: image_prefix_length = %d, prefix_length = %d, prompt_position = %d, generation_position = %d, block_size = %d\n",
+            __func__, image_prefix_length, prefix_length, prompt_position, generation_position, block_size);
 
     if (cparams.d2f_image_prefix_length == image_prefix_length &&
         cparams.d2f_prefix_length == prefix_length &&
+        cparams.d2f_prompt_position == prompt_position &&
+        cparams.d2f_generation_position == generation_position &&
         cparams.d2f_block_size == block_size) {
         return;
     }
 
     cparams.d2f_image_prefix_length = image_prefix_length;
     cparams.d2f_prefix_length = prefix_length;
+    cparams.d2f_prompt_position = prompt_position;
+    cparams.d2f_generation_position = generation_position;
     cparams.d2f_block_size = block_size;
     sched_need_reserve = true;
 }
@@ -1429,13 +1439,35 @@ int llama_context::encode(const llama_batch & batch_inp) {
     const int64_t n_embd = hparams.n_embd_inp_enc();
     const int64_t n_vocab = model.vocab.n_tokens();
 
-    // note: during encode, we always pass the full sequence starting from pos = 0
-    if (!balloc->init(batch_inp, model.vocab, nullptr, n_embd, cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max, true)) {
+    // Token embeddings require every row, while logits-only encoder and
+    // no-cache diffusion graphs can honor the caller's output selection.
+    const bool output_all =
+            cparams.embeddings ||
+            !llm_arch_is_diffusion(model.arch) ||
+            batch_inp.logits == nullptr;
+    if (!balloc->init(
+                batch_inp,
+                model.vocab,
+                nullptr,
+                n_embd,
+                cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max,
+                output_all,
+                batch_inp.embd != nullptr)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
     }
 
-    const uint32_t n_tokens = balloc->get_n_tokens();
+    const uint32_t n_tokens  = balloc->get_n_tokens();
+    const uint32_t n_outputs = balloc->get_n_outputs();
+    if (output_all && n_outputs != n_tokens) {
+        LLAMA_LOG_ERROR(
+                "%s: embeddings require all input tokens as outputs "
+                "(n_outputs = %u, n_tokens = %u)\n",
+                __func__,
+                n_outputs,
+                n_tokens);
+        return -1;
+    }
 
     // [TAG_NO_CACHE_PAD]
     // TODO: add new split mode where we pad the input sequences so that ubatch.equal_seqs == true
@@ -1456,16 +1488,18 @@ int llama_context::encode(const llama_batch & batch_inp) {
     n_queued_tokens += n_tokens;
 
     // reserve output buffer
-    if (output_reserve(n_tokens) < n_tokens) {
-        LLAMA_LOG_ERROR("%s: could not reserve space for batch with %u outputs\n", __func__, n_tokens);
+    if (output_reserve(n_outputs) < n_outputs) {
+        LLAMA_LOG_ERROR("%s: could not reserve space for batch with %u outputs\n", __func__, n_outputs);
         return -2;
     };
 
-    for (uint32_t i = 0; i < n_tokens; ++i) {
-        output_ids[i] = i;
+    const std::vector<int32_t> & out_ids = balloc->get_out_ids();
+    GGML_ASSERT(out_ids.size() == n_outputs);
+    for (uint32_t i = 0; i < n_outputs; ++i) {
+        output_ids[out_ids[i]] = i;
     }
 
-    n_outputs = n_tokens;
+    this->n_outputs = n_outputs;
 
     const auto causal_attn_org = cparams.causal_attn;
 
@@ -1498,7 +1532,12 @@ int llama_context::encode(const llama_batch & batch_inp) {
         GGML_ASSERT(backend_res != nullptr);
         GGML_ASSERT(logits.data != nullptr);
 
-        ggml_backend_tensor_get_async(backend_res, t_logits, logits.data, 0, n_tokens*n_vocab*sizeof(float));
+        ggml_backend_tensor_get_async(
+                backend_res,
+                t_logits,
+                logits.data,
+                0,
+                n_outputs*n_vocab*sizeof(float));
     }
 
     // extract embeddings
@@ -1768,7 +1807,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
-    if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all)) {
+    const bool allow_position_gaps = llm_arch_is_diffusion(model.arch) && batch_inp.embd != nullptr;
+    if (!balloc->init(
+                batch_inp,
+                vocab,
+                memory.get(),
+                n_embd,
+                n_seq_max,
+                output_all,
+                allow_position_gaps)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
     }
@@ -3358,7 +3405,14 @@ void llama_context::opt_epoch_iter(
             batch.logits  [pos_batch]    = true;
         }
 
-        if (!balloc->init(batch, model.vocab, nullptr, model.hparams.n_embd_inp(), cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max, true)) {
+        if (!balloc->init(
+                    batch,
+                    model.vocab,
+                    nullptr,
+                    model.hparams.n_embd_inp(),
+                    cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max,
+                    true,
+                    false)) {
             LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
             return;
         }
@@ -3700,8 +3754,15 @@ void llama_set_d2f_attention(
         llama_context * ctx,
         int32_t image_prefix_length,
         int32_t prefix_length,
+        int32_t prompt_position,
+        int32_t generation_position,
         int32_t block_size) {
-    ctx->set_d2f_attention(image_prefix_length, prefix_length, block_size);
+    ctx->set_d2f_attention(
+            image_prefix_length,
+            prefix_length,
+            prompt_position,
+            generation_position,
+            block_size);
 }
 
 void llama_set_warmup(llama_context * ctx, bool warmup) {

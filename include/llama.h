@@ -995,10 +995,11 @@ extern "C" {
     // If set to true, the model will only attend to the past tokens
     LLAMA_API void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn);
 
-    // Configure the no-cache D2F attention mask used by LLaDA-o block
-    // diffusion decoding. The image prefix attends bidirectionally within
-    // itself. The following text prefix attends to both the image and text
-    // prefix, without leaking text back into the image encoder states.
+    // Configure the D2F attention mask used by LLaDA-o block
+    // diffusion decoding. Image spans are identified by position ID, and
+    // attend bidirectionally only within the same span. The following text
+    // prefix attends to both the image and text prefix, without leaking text
+    // back into the image encoder states.
     // Generated tokens attend to the full prefix, their own block, and all
     // earlier generated blocks. Pass invalid lengths or a non-positive block
     // size to disable the custom mask.
@@ -1006,6 +1007,8 @@ extern "C" {
             struct llama_context * ctx,
             int32_t image_prefix_length,
             int32_t prefix_length,
+            int32_t prompt_position,
+            int32_t generation_position,
             int32_t block_size);
 
     // Set whether the model is in warmup mode or not

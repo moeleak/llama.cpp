@@ -87,8 +87,8 @@ llama_model_llada::graph::graph(const llama_model & model, const llm_graph_param
     // inp_pos - contains the positions
     ggml_tensor * inp_pos = build_inp_pos();
 
-    // Non-causal attention for diffusion
-    auto * inp_attn = build_attn_inp_no_cache();
+    auto * inp_attn_kv = mctx ? build_attn_inp_kv() : nullptr;
+    auto * inp_attn_no_cache = mctx ? nullptr : build_attn_inp_no_cache();
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
@@ -125,9 +125,13 @@ llama_model_llada::graph::graph(const llama_model & model, const llm_graph_param
             cb(Kcur, "Kcur", il);
             cb(Vcur, "Vcur", il);
 
-            cur = build_attn(inp_attn,
-                    model.layers[il].wo, NULL, model.layers[il].wo_s,
-                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f / sqrtf(float(n_embd_head)), il);
+            cur = inp_attn_kv
+                    ? build_attn(inp_attn_kv,
+                            model.layers[il].wo, NULL, model.layers[il].wo_s,
+                            Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f / sqrtf(float(n_embd_head)), il)
+                    : build_attn(inp_attn_no_cache,
+                            model.layers[il].wo, NULL, model.layers[il].wo_s,
+                            Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f / sqrtf(float(n_embd_head)), il);
         }
         if (il == n_layer - 1 && inp_out_ids) {
             cur   = ggml_get_rows(ctx0, cur, inp_out_ids);

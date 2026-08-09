@@ -27,6 +27,11 @@ struct mtmd_image_preproc_out {
 };
 
 clip_image_size mtmd_lladao_image_size(const clip_image_size & input_size);
+clip_image_size mtmd_lladao_exact_tile_size(const clip_image_size & input_size);
+clip_image_f32 mtmd_lladao_exact_tile_image(
+        const clip_image_u8 & img,
+        const float image_mean[3],
+        const float image_std[3]);
 std::vector<int32_t> mtmd_lladao_position_ids(int patch_rows, int patch_cols);
 
 // base class, models must inherit from this class
@@ -127,8 +132,12 @@ struct mtmd_image_preprocessor_dyn_size : mtmd_image_preprocessor {
 };
 
 struct mtmd_image_preprocessor_lladao : mtmd_image_preprocessor {
-    mtmd_image_preprocessor_lladao(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
+    mtmd_image_preprocessor_lladao(const clip_ctx * ctx, bool exact_tile = false)
+        : mtmd_image_preprocessor(ctx), exact_tile(exact_tile) {}
     mtmd_image_preproc_out preprocess(const clip_image_u8 & img) override;
+
+private:
+    bool exact_tile;
 };
 
 // similar to mtmd_image_preprocessor_dyn_size, but resize the image to have longest edge equal to hparams.image_longest_edge, while preserving aspect ratio

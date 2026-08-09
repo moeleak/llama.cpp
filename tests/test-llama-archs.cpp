@@ -328,6 +328,93 @@ static std::vector<float> get_logits(
     return ret;
 }
 
+static double test_d2f_prefix_cache(llama_model * model, const std::vector<llama_token> & tokens) {
+    static const std::vector<llama_pos> positions = { 0, 0, 0, 1, 2, 3, 4, 5, 6 };
+    static constexpr int32_t image_prefix_length = 3;
+    static constexpr int32_t prefix_length = 5;
+    static constexpr int32_t prompt_position = 1;
+    static constexpr int32_t generation_position = 3;
+    static constexpr int32_t block_size = 2;
+    static constexpr int32_t generation_length = 4;
+
+    GGML_ASSERT(tokens.size() >= positions.size());
+
+    auto make_context = [model]() {
+        llama_context_params params = llama_context_default_params();
+        params.n_ctx = 16;
+        params.n_batch = 16;
+        params.n_ubatch = 16;
+        params.n_outputs_max = generation_length;
+        params.no_perf = true;
+
+        llama_context_ptr context(llama_init_from_model(model, params));
+        if (!context) {
+            throw std::runtime_error("failed to create D2F cache test context");
+        }
+        llama_set_causal_attn(context.get(), false);
+        llama_set_d2f_attention(
+                context.get(),
+                image_prefix_length,
+                prefix_length,
+                prompt_position,
+                generation_position,
+                block_size);
+        return context;
+    };
+
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    std::vector<float> logits_full;
+    logits_full.reserve(generation_length*n_vocab);
+    {
+        llama_context_ptr context = make_context();
+        llama_batch batch = llama_batch_init(positions.size(), 0, 1);
+        for (int32_t i = 0; i < (int32_t) positions.size(); ++i) {
+            common_batch_add(batch, tokens[i], positions[i], { 0 }, i >= prefix_length);
+        }
+        if (llama_encode(context.get(), batch) != 0) {
+            llama_batch_free(batch);
+            throw std::runtime_error("D2F full-sequence encode failed");
+        }
+        for (int32_t i = prefix_length; i < (int32_t) positions.size(); ++i) {
+            const float * row = llama_get_logits_ith(context.get(), i);
+            logits_full.insert(logits_full.end(), row, row + n_vocab);
+        }
+        llama_batch_free(batch);
+    }
+
+    std::vector<float> logits_cached;
+    logits_cached.reserve(generation_length*n_vocab);
+    {
+        llama_context_ptr context = make_context();
+        llama_batch prefix = llama_batch_init(prefix_length, 0, 1);
+        for (int32_t i = 0; i < prefix_length; ++i) {
+            common_batch_add(prefix, tokens[i], positions[i], { 0 }, i == prefix_length - 1);
+        }
+        if (llama_decode(context.get(), prefix) != 0) {
+            llama_batch_free(prefix);
+            throw std::runtime_error("D2F cached prefix decode failed");
+        }
+        llama_batch_free(prefix);
+
+        llama_batch generation = llama_batch_init(generation_length, 0, 1);
+        for (int32_t i = 0; i < generation_length; ++i) {
+            const int32_t source = prefix_length + i;
+            common_batch_add(generation, tokens[source], positions[source], { 0 }, true);
+        }
+        if (llama_decode(context.get(), generation) != 0) {
+            llama_batch_free(generation);
+            throw std::runtime_error("D2F cached generation decode failed");
+        }
+        for (int32_t i = 0; i < generation_length; ++i) {
+            const float * row = llama_get_logits_ith(context.get(), i);
+            logits_cached.insert(logits_cached.end(), row, row + n_vocab);
+        }
+        llama_batch_free(generation);
+    }
+
+    return nmse(logits_full, logits_cached);
+}
+
 static bool moe_mandatory(const llm_arch arch) {
     switch (arch) {
         case LLM_ARCH_LLAMA4:
@@ -604,6 +691,13 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                     if (logits_cpu.empty()) {
                         model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, encode);
                         logits_cpu = get_logits(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens, encode);
+                        if (arch == LLM_ARCH_LLADA || arch == LLM_ARCH_LLADA_MOE) {
+                            const double cache_nmse = test_d2f_prefix_cache(model_and_ctx_cpu.first.get(), tokens);
+                            if (cache_nmse > 1e-5) {
+                                throw std::runtime_error(
+                                        "D2F prefix-cache logits mismatch: NMSE=" + std::to_string(cache_nmse));
+                            }
+                        }
                     }
                     if (dc.split_mode != LLAMA_SPLIT_MODE_TENSOR || llm_arch_supports_sm_tensor(arch)) {
                         model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, dc.devs, dc.split_mode, encode);
