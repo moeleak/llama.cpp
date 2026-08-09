@@ -412,7 +412,56 @@ static double test_d2f_prefix_cache(llama_model * model, const std::vector<llama
         llama_batch_free(generation);
     }
 
-    return nmse(logits_full, logits_cached);
+    std::vector<uint8_t> prefix_state;
+    {
+        llama_context_ptr context = make_context();
+        llama_batch prefix = llama_batch_init(prefix_length, 0, 1);
+        for (int32_t i = 0; i < prefix_length; ++i) {
+            common_batch_add(prefix, tokens[i], positions[i], { 0 }, i == prefix_length - 1);
+        }
+        if (llama_decode(context.get(), prefix) != 0) {
+            llama_batch_free(prefix);
+            throw std::runtime_error("D2F transferred prefix decode failed");
+        }
+        llama_batch_free(prefix);
+
+        prefix_state.resize(llama_state_seq_get_size(context.get(), 0));
+        const size_t copied = llama_state_seq_get_data(
+                context.get(), prefix_state.data(), prefix_state.size(), 0);
+        if (copied == 0 || copied != prefix_state.size()) {
+            throw std::runtime_error("D2F prefix state export failed");
+        }
+    }
+
+    std::vector<float> logits_transferred;
+    logits_transferred.reserve(generation_length*n_vocab);
+    {
+        llama_context_ptr context = make_context();
+        const size_t restored = llama_state_seq_set_data(
+                context.get(), prefix_state.data(), prefix_state.size(), 0);
+        if (restored == 0 || restored != prefix_state.size()) {
+            throw std::runtime_error("D2F prefix state import failed");
+        }
+
+        llama_batch generation = llama_batch_init(generation_length, 0, 1);
+        for (int32_t i = 0; i < generation_length; ++i) {
+            const int32_t source = prefix_length + i;
+            common_batch_add(generation, tokens[source], positions[source], { 0 }, true);
+        }
+        if (llama_decode(context.get(), generation) != 0) {
+            llama_batch_free(generation);
+            throw std::runtime_error("D2F transferred generation decode failed");
+        }
+        for (int32_t i = 0; i < generation_length; ++i) {
+            const float * row = llama_get_logits_ith(context.get(), i);
+            logits_transferred.insert(logits_transferred.end(), row, row + n_vocab);
+        }
+        llama_batch_free(generation);
+    }
+
+    return std::max(
+            nmse(logits_full, logits_cached),
+            nmse(logits_cached, logits_transferred));
 }
 
 static bool moe_mandatory(const llm_arch arch) {

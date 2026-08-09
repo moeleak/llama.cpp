@@ -40,9 +40,15 @@ struct d2f_result {
     int32_t iterations = 0;
     int32_t image_tokens = 0;
     int32_t input_tokens = 0;
+    uint64_t state_bytes = 0;
+    double prefill_seconds = 0.0;
+    double state_io_seconds = 0.0;
+    double decode_seconds = 0.0;
     double generation_seconds = 0.0;
     bool cancelled = false;
     bool preprocessed_only = false;
+    bool prefilled_only = false;
+    bool decoded_from_state = false;
 };
 
 class d2f_engine {
@@ -56,6 +62,8 @@ class d2f_engine {
     d2f_engine & operator=(d2f_engine &&) noexcept;
 
     d2f_result generate(const d2f_request & request);
+    d2f_result prefill_to_file(const d2f_request & request, const std::string & state_path);
+    d2f_result decode_from_file(const std::string & state_path);
 
     void set_adapter(const std::string & path, float scale = 1.0f);
     void clear_adapter();

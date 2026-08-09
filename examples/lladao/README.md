@@ -58,6 +58,49 @@ same three scheduler updates. These numbers are a device-specific smoke
 benchmark, not an accuracy benchmark; the remaining one-time prefill is still
 too slow for interactive use.
 
+## Prefill/decode separation
+
+The exact prefix KV state can cross a process boundary. The P process loads
+the language model, vision projector, image, and optional LoRA, then exits
+after writing the occupied prefix KV cells:
+
+```sh
+./build/bin/llama-lladao-d2f \
+  --model /path/to/lladao-language-Q3_K_M.gguf \
+  --mmproj /path/to/lladao-mmproj-q8_0.gguf \
+  --image /path/to/screenshot.png \
+  --prompt 'Click on Settings.' \
+  --pd-prefill-out /path/to/prefix.state \
+  --gpu-layers 999
+```
+
+The D process restores that state and runs D2F without loading `mmproj`, the
+source image, or its text prompt:
+
+```sh
+./build/bin/llama-lladao-d2f \
+  --model /path/to/lladao-language-Q3_K_M.gguf \
+  --pd-decode-in /path/to/prefix.state \
+  --gpu-layers 999
+```
+
+P and D must use the same language GGUF, RoPE settings, mask token, and LoRA
+configuration. The state carries a versioned contract and rejects mismatched
+model dimensions, model size, parameter count, RoPE settings, LoRA presence,
+scale, or file size before decoding. This is an exact F16 KV handoff, not KV
+compression. File transfer can be expensive, so local sequential PD is a
+correctness and deployment primitive rather than a single-request speedup. It
+becomes useful when P and D are independently scheduled or one prefetched
+state is reused by multiple decode runs.
+
+On the same Pixel 9 Pro XL configuration above, the P process prefetched 2,178
+tokens in 530.13 seconds and wrote a 1,141,926,288-byte state in 3.24 seconds.
+A fresh D process restored it in 2.61 seconds, completed all 15 D2F passes in
+176.14 seconds, and produced the same output and per-pass update counts as the
+in-process prefix cache. Observed D-process RSS was about 5.7 GiB versus about
+6.4 GiB while the vision model was resident in P. This is a one-request smoke
+comparison, not a 100-sample accuracy benchmark.
+
 ## Full-page tile retrieval
 
 Use full-page mode when the original screenshot is too large for the native
@@ -151,6 +194,25 @@ examples/lladao/android/run-vulkan.sh \
 `--vision-gpu` is independent from `--gpu-layers`. This is useful on devices
 whose Vulkan heap can hold the vision projector but not the language model.
 Use `--no-vision-gpu` to validate the same path on the CPU.
+
+The Android helper accepts `--pd-prefill-out` and `--pd-decode-in` as paths on
+the device. For example, first create the state and then start a fresh D
+process without passing an image or `mmproj`:
+
+```sh
+examples/lladao/android/run-vulkan.sh \
+  --model /path/to/lladao-language-Q3_K_M.gguf \
+  --mmproj /path/to/lladao-mmproj-q8_0.gguf \
+  --image /path/to/screenshot.png \
+  --prompt 'Click on Settings.' \
+  --pd-prefill-out /data/local/tmp/lladao-vulkan/prefix.state \
+  --gpu-layers 999
+
+examples/lladao/android/run-vulkan.sh \
+  --model /path/to/lladao-language-Q3_K_M.gguf \
+  --pd-decode-in /data/local/tmp/lladao-vulkan/prefix.state \
+  --gpu-layers 999
+```
 
 The unquantized language model, vision projector, and F32 adapter use about
 15.94 GiB before compute buffers. The prefix cache adds storage proportional

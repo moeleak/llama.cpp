@@ -41,6 +41,8 @@ struct params {
     std::string image;
     std::string prompt;
     std::string retrieval_query;
+    std::string pd_prefill_out;
+    std::string pd_decode_in;
     int32_t     n_ctx          = 16384;
     int32_t     n_gpu_layers   = 999;
     int32_t     n_threads      = 0;
@@ -63,12 +65,13 @@ void print_usage(const char * program) {
     std::fprintf(stderr,
             "Usage: %s --model MODEL.gguf --mmproj MMPROJ.gguf --image IMAGE "
             "--prompt GUI_INSTRUCTION [options]\n"
+            "       %s --model MODEL.gguf --pd-decode-in PREFIX.state [options]\n"
             "\n"
             "Required:\n"
             "  --model PATH          LLaDA-o language GGUF\n"
-            "  --mmproj PATH         LLaDA-o vision projector GGUF\n"
-            "  --image PATH          Screenshot to ground\n"
-            "  --prompt TEXT         Exact GUI instruction, e.g. 'Click on Settings.'\n"
+            "  --mmproj PATH         LLaDA-o vision projector GGUF (P and normal modes)\n"
+            "  --image PATH          Screenshot to ground (P and normal modes)\n"
+            "  --prompt TEXT         Exact GUI instruction (P and normal modes)\n"
             "\n"
             "Options:\n"
             "  --lora PATH           Optional F32 D2F LoRA GGUF\n"
@@ -79,6 +82,8 @@ void print_usage(const char * program) {
             "  --threads N           CPU threads (default: backend choice)\n"
             "  --max-iterations N    D2F iteration limit (default: 256)\n"
             "  --no-prefix-cache     Recompute the complete sequence every D2F iteration\n"
+            "  --pd-prefill-out PATH Prefill the exact prefix KV state, save it, and exit\n"
+            "  --pd-decode-in PATH   Restore an exact prefix KV state and decode without vision input\n"
             "  --mask-token-id N     Override missing tokenizer mask metadata\n"
             "  --full-page-tiles     Split the original page into exact row-major tiles\n"
             "  --full-page-tile-size N\n"
@@ -95,6 +100,7 @@ void print_usage(const char * program) {
             "  --yarn-orig-ctx N     YaRN original context length (default: 16384)\n"
             "  --preprocess-only     Stop after validating multimodal layout\n"
             "  -h, --help            Show this help\n",
+            program,
             program);
 }
 
@@ -155,6 +161,10 @@ params parse_args(int argc, char ** argv) {
             result.max_iterations = parse_i32(arg.c_str(), next());
         } else if (arg == "--no-prefix-cache") {
             result.prefix_cache = false;
+        } else if (arg == "--pd-prefill-out") {
+            result.pd_prefill_out = next();
+        } else if (arg == "--pd-decode-in") {
+            result.pd_decode_in = next();
         } else if (arg == "--mask-token-id") {
             result.mask_token_id = parse_i32(arg.c_str(), next());
         } else if (arg == "--full-page-tiles") {
@@ -184,8 +194,24 @@ params parse_args(int argc, char ** argv) {
         }
     }
 
-    if (result.model.empty() || result.mmproj.empty() || result.image.empty() || result.prompt.empty()) {
-        throw std::invalid_argument("--model, --mmproj, --image, and --prompt are required");
+    if (result.model.empty()) {
+        throw std::invalid_argument("--model is required");
+    }
+    if (!result.pd_prefill_out.empty() && !result.pd_decode_in.empty()) {
+        throw std::invalid_argument("--pd-prefill-out and --pd-decode-in are mutually exclusive");
+    }
+    if (result.pd_decode_in.empty() &&
+        (result.mmproj.empty() || result.image.empty() || result.prompt.empty())) {
+        throw std::invalid_argument(
+                "--mmproj, --image, and --prompt are required outside PD decode mode");
+    }
+    if ((!result.pd_prefill_out.empty() || !result.pd_decode_in.empty()) &&
+        !result.prefix_cache) {
+        throw std::invalid_argument("PD separation requires the exact prefix cache");
+    }
+    if ((!result.pd_prefill_out.empty() || !result.pd_decode_in.empty()) &&
+        result.preprocess_only) {
+        throw std::invalid_argument("--preprocess-only is not valid in PD mode");
     }
     if (result.n_ctx <= 0 || result.n_threads < 0 || result.max_iterations <= 0) {
         throw std::invalid_argument("context size, threads, and max iterations must be valid");
@@ -509,6 +535,182 @@ struct prefix {
     llama_pos generation_position = 0;
 };
 
+struct cached_prefix_layout {
+    int32_t image_length = 0;
+    int32_t total_length = 0;
+    llama_pos prompt_position = 0;
+    llama_pos generation_position = 0;
+};
+
+struct pd_artifact_metadata {
+    cached_prefix_layout layout;
+    llama_token mask = LLAMA_TOKEN_NULL;
+    llama_token bos = LLAMA_TOKEN_NULL;
+    llama_token eos = LLAMA_TOKEN_NULL;
+    int32_t n_vocab = 0;
+    int32_t n_embd = 0;
+    int32_t yarn_orig_ctx = 0;
+    float yarn_factor = 1.0f;
+    uint64_t model_size = 0;
+    uint64_t model_parameters = 0;
+    bool has_adapter = false;
+    float adapter_scale = 1.0f;
+    uint64_t adapter_size = 0;
+};
+
+constexpr uint32_t D2F_PD_MAGIC = 0x32445044U;
+constexpr int32_t D2F_PD_VERSION = 1;
+constexpr size_t D2F_PD_METADATA_TOKENS = 23;
+
+llama_token bits_to_token(uint32_t bits) {
+    llama_token token;
+    static_assert(sizeof(token) == sizeof(bits), "llama_token must store 32-bit metadata");
+    std::memcpy(&token, &bits, sizeof(token));
+    return token;
+}
+
+uint32_t token_to_bits(llama_token token) {
+    uint32_t bits;
+    std::memcpy(&bits, &token, sizeof(bits));
+    return bits;
+}
+
+llama_token float_to_token(float value) {
+    uint32_t bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits_to_token(bits);
+}
+
+float token_to_float(llama_token token) {
+    const uint32_t bits = token_to_bits(token);
+    float value;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+void append_u64(std::vector<llama_token> & tokens, uint64_t value) {
+    tokens.push_back(bits_to_token(static_cast<uint32_t>(value)));
+    tokens.push_back(bits_to_token(static_cast<uint32_t>(value >> 32)));
+}
+
+uint64_t read_u64(const std::vector<llama_token> & tokens, size_t index) {
+    return static_cast<uint64_t>(token_to_bits(tokens.at(index))) |
+           (static_cast<uint64_t>(token_to_bits(tokens.at(index + 1))) << 32);
+}
+
+uint64_t file_size(const std::string & path) {
+    if (path.empty()) {
+        return 0;
+    }
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file) {
+        throw std::runtime_error("failed to inspect file: " + path);
+    }
+    const std::streampos end = file.tellg();
+    if (end < 0) {
+        throw std::runtime_error("failed to determine file size: " + path);
+    }
+    return static_cast<uint64_t>(end);
+}
+
+std::vector<llama_token> encode_pd_metadata(const pd_artifact_metadata & metadata) {
+    std::vector<llama_token> tokens;
+    tokens.reserve(D2F_PD_METADATA_TOKENS);
+    tokens.push_back(bits_to_token(D2F_PD_MAGIC));
+    tokens.push_back(D2F_PD_VERSION);
+    tokens.push_back(metadata.layout.image_length);
+    tokens.push_back(metadata.layout.total_length);
+    tokens.push_back(metadata.layout.prompt_position);
+    tokens.push_back(metadata.layout.generation_position);
+    tokens.push_back(D2F_GENERATION_LENGTH);
+    tokens.push_back(D2F_BLOCK_LENGTH);
+    tokens.push_back(metadata.mask);
+    tokens.push_back(metadata.bos);
+    tokens.push_back(metadata.eos);
+    tokens.push_back(metadata.n_vocab);
+    tokens.push_back(metadata.n_embd);
+    tokens.push_back(metadata.yarn_orig_ctx);
+    tokens.push_back(float_to_token(metadata.yarn_factor));
+    append_u64(tokens, metadata.model_size);
+    append_u64(tokens, metadata.model_parameters);
+    tokens.push_back(metadata.has_adapter ? 1 : 0);
+    tokens.push_back(float_to_token(metadata.adapter_scale));
+    append_u64(tokens, metadata.adapter_size);
+    if (tokens.size() != D2F_PD_METADATA_TOKENS) {
+        throw std::logic_error("PD metadata layout is inconsistent");
+    }
+    return tokens;
+}
+
+pd_artifact_metadata decode_pd_metadata(const std::vector<llama_token> & tokens) {
+    if (tokens.size() != D2F_PD_METADATA_TOKENS || token_to_bits(tokens[0]) != D2F_PD_MAGIC) {
+        throw std::runtime_error("file is not a LLaDA-o D2F PD state");
+    }
+    if (tokens[1] != D2F_PD_VERSION) {
+        throw std::runtime_error("unsupported LLaDA-o D2F PD state version");
+    }
+
+    pd_artifact_metadata metadata;
+    metadata.layout.image_length = tokens[2];
+    metadata.layout.total_length = tokens[3];
+    metadata.layout.prompt_position = tokens[4];
+    metadata.layout.generation_position = tokens[5];
+    if (tokens[6] != D2F_GENERATION_LENGTH || tokens[7] != D2F_BLOCK_LENGTH) {
+        throw std::runtime_error("PD state uses incompatible D2F dimensions");
+    }
+    metadata.mask = tokens[8];
+    metadata.bos = tokens[9];
+    metadata.eos = tokens[10];
+    metadata.n_vocab = tokens[11];
+    metadata.n_embd = tokens[12];
+    metadata.yarn_orig_ctx = tokens[13];
+    metadata.yarn_factor = token_to_float(tokens[14]);
+    metadata.model_size = read_u64(tokens, 15);
+    metadata.model_parameters = read_u64(tokens, 17);
+    metadata.has_adapter = tokens[19] != 0;
+    metadata.adapter_scale = token_to_float(tokens[20]);
+    metadata.adapter_size = read_u64(tokens, 21);
+
+    if (metadata.layout.image_length <= 0 ||
+        metadata.layout.total_length < metadata.layout.image_length ||
+        metadata.layout.prompt_position < 0 ||
+        metadata.layout.generation_position < metadata.layout.prompt_position ||
+        metadata.layout.total_length > std::numeric_limits<int32_t>::max() - D2F_GENERATION_LENGTH ||
+        metadata.n_vocab <= 0 || metadata.n_embd <= 0 ||
+        metadata.yarn_orig_ctx <= 0 || metadata.yarn_factor < 1.0f ||
+        !std::isfinite(metadata.yarn_factor) || !std::isfinite(metadata.adapter_scale)) {
+        throw std::runtime_error("PD state metadata is invalid");
+    }
+    return metadata;
+}
+
+pd_artifact_metadata peek_pd_metadata(const std::string & path) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        throw std::runtime_error("failed to open PD state: " + path);
+    }
+
+    uint32_t state_magic = 0;
+    uint32_t state_version = 0;
+    uint32_t token_count = 0;
+    file.read(reinterpret_cast<char *>(&state_magic), sizeof(state_magic));
+    file.read(reinterpret_cast<char *>(&state_version), sizeof(state_version));
+    file.read(reinterpret_cast<char *>(&token_count), sizeof(token_count));
+    if (!file || state_magic == 0 || state_version == 0 ||
+        token_count != D2F_PD_METADATA_TOKENS) {
+        throw std::runtime_error("PD state header is invalid");
+    }
+
+    std::vector<llama_token> tokens(token_count);
+    file.read(
+            reinterpret_cast<char *>(tokens.data()),
+            static_cast<std::streamsize>(tokens.size() * sizeof(tokens[0])));
+    if (!file) {
+        throw std::runtime_error("PD state metadata is truncated");
+    }
+    return decode_pd_metadata(tokens);
+}
+
 void append_embedding(std::vector<float> & destination, const std::vector<float> & source) {
     destination.insert(destination.end(), source.begin(), source.end());
 }
@@ -817,7 +1019,7 @@ void fill_prefix_batch(
 
 void fill_generation_batch(
         llama_batch & batch,
-        const prefix & input_prefix,
+        llama_pos generation_position,
         const std::vector<int32_t> & generation_tokens,
         int32_t active_generation_length,
         token_embedding_reader & token_embeddings,
@@ -829,7 +1031,7 @@ void fill_generation_batch(
                 embedding.begin(),
                 embedding.end(),
                 batch.embd + static_cast<size_t>(i) * n_embd);
-        batch.pos[i] = input_prefix.generation_position + i;
+        batch.pos[i] = generation_position + i;
         batch.logits[i] = 1;
     }
 }
@@ -1053,8 +1255,8 @@ struct d2f_engine::impl {
     std::mutex operation_mutex;
 
     explicit impl(const d2f_engine_params & p) {
-        if (p.model_path.empty() || p.mmproj_path.empty()) {
-            throw std::invalid_argument("model and mmproj paths must not be empty");
+        if (p.model_path.empty()) {
+            throw std::invalid_argument("model path must not be empty");
         }
         if (p.context_size <= 0 || p.threads < 0 || p.max_iterations <= 0) {
             throw std::invalid_argument("context size, threads, and max iterations must be valid");
@@ -1111,7 +1313,6 @@ struct d2f_engine::impl {
         vision_end = special_token(vocab, "<|vision_end|>");
 
         token_embeddings = std::make_unique<token_embedding_reader>(base.model, n_embd, n_vocab);
-        native_vision = make_vision_context(base, model.get(), false);
 
         if (!p.adapter_path.empty()) {
             set_adapter_locked(p.adapter_path, p.adapter_scale);
@@ -1220,7 +1421,230 @@ struct d2f_engine::impl {
         output_capacity = required_outputs;
     }
 
-    d2f_result generate_locked(const d2f_request & request) {
+    pd_artifact_metadata current_pd_metadata(const cached_prefix_layout & layout) const {
+        pd_artifact_metadata metadata;
+        metadata.layout = layout;
+        metadata.mask = mask;
+        metadata.bos = bos;
+        metadata.eos = eos;
+        metadata.n_vocab = n_vocab;
+        metadata.n_embd = n_embd;
+        metadata.yarn_orig_ctx = base.yarn_orig_ctx;
+        metadata.yarn_factor = base.yarn_factor;
+        metadata.model_size = llama_model_size(model.get());
+        metadata.model_parameters = llama_model_n_params(model.get());
+        metadata.has_adapter = adapter != nullptr;
+        metadata.adapter_scale = adapter_scale;
+        metadata.adapter_size = adapter ? file_size(adapter_path) : 0;
+        return metadata;
+    }
+
+    void validate_pd_metadata(const pd_artifact_metadata & metadata) const {
+        if (metadata.mask != mask || metadata.bos != bos || metadata.eos != eos ||
+            metadata.n_vocab != n_vocab || metadata.n_embd != n_embd ||
+            metadata.model_size != llama_model_size(model.get()) ||
+            metadata.model_parameters != llama_model_n_params(model.get())) {
+            throw std::runtime_error("PD state does not match the loaded language model");
+        }
+        if (metadata.yarn_orig_ctx != base.yarn_orig_ctx ||
+            metadata.yarn_factor != base.yarn_factor) {
+            throw std::runtime_error("PD state does not match the configured RoPE scaling");
+        }
+        if (metadata.has_adapter != (adapter != nullptr) ||
+            metadata.adapter_scale != adapter_scale ||
+            metadata.adapter_size != (adapter ? file_size(adapter_path) : 0)) {
+            throw std::runtime_error("PD state does not match the loaded LoRA adapter");
+        }
+        const int32_t required_tokens =
+                metadata.layout.total_length + D2F_GENERATION_LENGTH;
+        if (required_tokens > base.n_ctx) {
+            throw std::runtime_error(
+                    "PD state needs " + std::to_string(required_tokens) +
+                    " tokens but context size is " + std::to_string(base.n_ctx));
+        }
+    }
+
+    uint64_t save_pd_state(
+            const std::string & path,
+            const cached_prefix_layout & layout) const {
+        if (path.empty()) {
+            throw std::invalid_argument("PD output path must not be empty");
+        }
+        const std::vector<llama_token> metadata =
+                encode_pd_metadata(current_pd_metadata(layout));
+        const size_t written = llama_state_seq_save_file(
+                context.get(),
+                path.c_str(),
+                0,
+                metadata.data(),
+                metadata.size());
+        if (written == 0) {
+            throw std::runtime_error("failed to save PD state: " + path);
+        }
+        return written;
+    }
+
+    pd_artifact_metadata load_pd_state(
+            const std::string & path,
+            uint64_t & state_bytes) {
+        const pd_artifact_metadata expected = peek_pd_metadata(path);
+        validate_pd_metadata(expected);
+
+        const int32_t required_tokens =
+                expected.layout.total_length + D2F_GENERATION_LENGTH;
+        ensure_context(required_tokens, D2F_GENERATION_LENGTH);
+        llama_memory_clear(llama_get_memory(context.get()), true);
+
+        std::vector<llama_token> metadata(D2F_PD_METADATA_TOKENS);
+        size_t token_count = 0;
+        const size_t read = llama_state_seq_load_file(
+                context.get(),
+                path.c_str(),
+                0,
+                metadata.data(),
+                metadata.size(),
+                &token_count);
+        if (read == 0 || token_count != metadata.size()) {
+            throw std::runtime_error("failed to restore PD state: " + path);
+        }
+        const pd_artifact_metadata restored = decode_pd_metadata(metadata);
+        if (encode_pd_metadata(restored) != encode_pd_metadata(expected)) {
+            throw std::runtime_error("PD state metadata changed while loading");
+        }
+        state_bytes = file_size(path);
+        return restored;
+    }
+
+    d2f_result decode_prefix_locked(
+            const cached_prefix_layout & layout,
+            const prefix * input_prefix,
+            bool prefix_cache,
+            d2f_result result,
+            std::chrono::steady_clock::time_point generation_started) {
+        if (!prefix_cache && input_prefix == nullptr) {
+            throw std::logic_error("full-sequence D2F decoding requires prefix embeddings");
+        }
+
+        llama_set_d2f_attention(
+                context.get(),
+                layout.image_length,
+                layout.total_length,
+                layout.prompt_position,
+                layout.generation_position,
+                D2F_BLOCK_LENGTH);
+
+        diffusion_d2f_scheduler_params scheduler_params;
+        scheduler_params.generation_length = D2F_GENERATION_LENGTH;
+        scheduler_params.block_length = D2F_BLOCK_LENGTH;
+        scheduler_params.max_iterations = base.max_iterations;
+        scheduler_params.mask_token_id = mask;
+        scheduler_params.initial_token_id = bos;
+        scheduler_params.eos_token_id = eos;
+        diffusion_d2f_scheduler scheduler(scheduler_params);
+
+        const auto decode_started = std::chrono::steady_clock::now();
+        while (!scheduler.done()) {
+            if (cancel_requested.load(std::memory_order_relaxed)) {
+                result.cancelled = true;
+                break;
+            }
+            const diffusion_d2f_step step = scheduler.prepare_step();
+            if (step.done) {
+                break;
+            }
+            const auto iteration_started = std::chrono::steady_clock::now();
+
+            llama_batch & batch = owned_batch->get();
+            if (prefix_cache) {
+                if (!llama_memory_seq_rm(
+                            llama_get_memory(context.get()),
+                            0,
+                            layout.generation_position,
+                            -1)) {
+                    throw std::runtime_error("failed to discard the dynamic D2F cache range");
+                }
+                fill_generation_batch(
+                        batch,
+                        layout.generation_position,
+                        scheduler.tokens(),
+                        step.active_end,
+                        *token_embeddings,
+                        n_embd);
+            } else {
+                llama_memory_clear(llama_get_memory(context.get()), true);
+                fill_batch(
+                        batch,
+                        *input_prefix,
+                        scheduler.tokens(),
+                        step.active_end,
+                        *token_embeddings,
+                        n_embd);
+            }
+            const int32_t decode_result = llama_decode(context.get(), batch);
+            if (decode_result != 0) {
+                throw std::runtime_error("llama_decode failed with code " + std::to_string(decode_result));
+            }
+
+            const float * logits = llama_get_logits(context.get());
+            if (!logits) {
+                throw std::runtime_error("language model returned no generation logits");
+            }
+            const std::vector<diffusion_d2f_candidate> candidates =
+                    diffusion_d2f_argmax_candidates(
+                            logits,
+                            step.active_end,
+                            n_vocab,
+                            prefix_cache ? 0 : layout.total_length,
+                            prefix_cache ? 0 : layout.total_length,
+                            D2F_GENERATION_LENGTH,
+                            false);
+            const std::vector<diffusion_d2f_update> updates = scheduler.apply_candidates(candidates);
+            const auto iteration_finished = std::chrono::steady_clock::now();
+            ++result.iterations;
+            std::fprintf(stderr,
+                    "D2F iteration %" PRId32 ": active [%" PRId32 ", %" PRId32
+                    "), blocks %" PRId32 ", updates %zu, decode_tokens=%" PRId32
+                    ", seconds=%.6f\n",
+                    step.iteration,
+                    step.active_start,
+                    step.active_end,
+                    step.blocks_added,
+                    updates.size(),
+                    batch.n_tokens,
+                    std::chrono::duration<double>(iteration_finished - iteration_started).count());
+        }
+
+        const auto generation_finished = std::chrono::steady_clock::now();
+        result.decode_seconds =
+                std::chrono::duration<double>(generation_finished - decode_started).count();
+        result.generation_seconds =
+                std::chrono::duration<double>(generation_finished - generation_started).count();
+        std::fprintf(
+                stderr,
+                "D2F decode_seconds=%.6f generation_seconds=%.6f\n",
+                result.decode_seconds,
+                result.generation_seconds);
+        if (base.print_timings) {
+            llama_perf_context_print(context.get());
+        }
+        if (result.cancelled) {
+            return result;
+        }
+
+        const std::vector<int32_t> & generated = scheduler.tokens();
+        const int32_t output_length = scheduler.output_length();
+        for (int32_t i = 0; i < output_length; ++i) {
+            if (generated[i] == mask) {
+                throw std::runtime_error("D2F stopped with unresolved mask tokens");
+            }
+            result.text += token_piece(vocab, generated[i]);
+        }
+        return result;
+    }
+
+    d2f_result generate_locked(
+            const d2f_request & request,
+            const std::string & pd_state_out = {}) {
         params p = base;
         p.image = request.image_path;
         p.prompt = request.prompt;
@@ -1232,8 +1656,14 @@ struct d2f_engine::impl {
         p.full_page_overview = request.full_page_overview;
         p.preprocess_only = request.preprocess_only;
 
+        if (!pd_state_out.empty() && (!p.prefix_cache || p.preprocess_only)) {
+            throw std::invalid_argument("PD prefill requires the exact prefix cache and language prefill");
+        }
         if (p.image.empty() || p.prompt.empty()) {
             throw std::invalid_argument("image path and prompt must not be empty");
+        }
+        if (p.mmproj.empty()) {
+            throw std::invalid_argument("mmproj path is required for image prefill");
         }
         if (p.full_page_tile_size <= 0 || p.full_page_tile_size > 980) {
             throw std::invalid_argument("full-page tile size must be in [1, 980]");
@@ -1474,22 +1904,19 @@ struct d2f_engine::impl {
 
         result.image_tokens = input_prefix.image_length;
         result.input_tokens = input_prefix.total_length;
+        const cached_prefix_layout layout = {
+            input_prefix.image_length,
+            input_prefix.total_length,
+            prompt_position,
+            input_prefix.generation_position,
+        };
         llama_set_d2f_attention(
                 context.get(),
-                input_prefix.image_length,
-                input_prefix.total_length,
-                prompt_position,
-                input_prefix.generation_position,
+                layout.image_length,
+                layout.total_length,
+                layout.prompt_position,
+                layout.generation_position,
                 D2F_BLOCK_LENGTH);
-
-        diffusion_d2f_scheduler_params scheduler_params;
-        scheduler_params.generation_length = D2F_GENERATION_LENGTH;
-        scheduler_params.block_length = D2F_BLOCK_LENGTH;
-        scheduler_params.max_iterations = p.max_iterations;
-        scheduler_params.mask_token_id = mask;
-        scheduler_params.initial_token_id = bos;
-        scheduler_params.eos_token_id = eos;
-        diffusion_d2f_scheduler scheduler(scheduler_params);
 
         llama_perf_context_reset(context.get());
         const auto generation_started = std::chrono::steady_clock::now();
@@ -1504,105 +1931,79 @@ struct d2f_engine::impl {
             }
             llama_synchronize(context.get());
             const auto prefill_finished = std::chrono::steady_clock::now();
+            result.prefill_seconds =
+                    std::chrono::duration<double>(prefill_finished - prefill_started).count();
             std::fprintf(
                     stderr,
                     "D2F prefix_cache=enabled cached_tokens=%" PRId32 " prefill_seconds=%.6f\n",
                     input_prefix.total_length,
-                    std::chrono::duration<double>(prefill_finished - prefill_started).count());
+                    result.prefill_seconds);
+
+            if (!pd_state_out.empty()) {
+                const auto state_started = std::chrono::steady_clock::now();
+                result.state_bytes = save_pd_state(pd_state_out, layout);
+                const auto state_finished = std::chrono::steady_clock::now();
+                result.state_io_seconds =
+                        std::chrono::duration<double>(state_finished - state_started).count();
+                result.generation_seconds =
+                        std::chrono::duration<double>(state_finished - generation_started).count();
+                result.prefilled_only = true;
+                std::fprintf(
+                        stderr,
+                        "D2F PD prefill state=%s bytes=%" PRIu64
+                        " state_save_seconds=%.6f total_seconds=%.6f\n",
+                        pd_state_out.c_str(),
+                        result.state_bytes,
+                        result.state_io_seconds,
+                        result.generation_seconds);
+                if (base.print_timings) {
+                    llama_perf_context_print(context.get());
+                }
+                return result;
+            }
         } else {
             std::fprintf(stderr, "D2F prefix_cache=disabled\n");
         }
-        while (!scheduler.done()) {
-            if (cancel_requested.load(std::memory_order_relaxed)) {
-                result.cancelled = true;
-                break;
-            }
-            const diffusion_d2f_step step = scheduler.prepare_step();
-            if (step.done) {
-                break;
-            }
-            const auto iteration_started = std::chrono::steady_clock::now();
+        return decode_prefix_locked(
+                layout,
+                &input_prefix,
+                p.prefix_cache,
+                std::move(result),
+                generation_started);
+    }
 
-            llama_batch & batch = owned_batch->get();
-            if (p.prefix_cache) {
-                if (!llama_memory_seq_rm(
-                            llama_get_memory(context.get()),
-                            0,
-                            input_prefix.generation_position,
-                            -1)) {
-                    throw std::runtime_error("failed to discard the dynamic D2F cache range");
-                }
-                fill_generation_batch(
-                        batch,
-                        input_prefix,
-                        scheduler.tokens(),
-                        step.active_end,
-                        *token_embeddings,
-                        n_embd);
-            } else {
-                llama_memory_clear(llama_get_memory(context.get()), true);
-                fill_batch(
-                        batch,
-                        input_prefix,
-                        scheduler.tokens(),
-                        step.active_end,
-                        *token_embeddings,
-                        n_embd);
-            }
-            const int32_t decode_result = llama_decode(context.get(), batch);
-            if (decode_result != 0) {
-                throw std::runtime_error("llama_decode failed with code " + std::to_string(decode_result));
-            }
-
-            const float * logits = llama_get_logits(context.get());
-            if (!logits) {
-                throw std::runtime_error("language model returned no generation logits");
-            }
-            const std::vector<diffusion_d2f_candidate> candidates =
-                    diffusion_d2f_argmax_candidates(
-                            logits,
-                            step.active_end,
-                            n_vocab,
-                            p.prefix_cache ? 0 : input_prefix.total_length,
-                            p.prefix_cache ? 0 : input_prefix.total_length,
-                            D2F_GENERATION_LENGTH,
-                            false);
-            const std::vector<diffusion_d2f_update> updates = scheduler.apply_candidates(candidates);
-            const auto iteration_finished = std::chrono::steady_clock::now();
-            ++result.iterations;
-            std::fprintf(stderr,
-                    "D2F iteration %" PRId32 ": active [%" PRId32 ", %" PRId32
-                    "), blocks %" PRId32 ", updates %zu, decode_tokens=%" PRId32
-                    ", seconds=%.6f\n",
-                    step.iteration,
-                    step.active_start,
-                    step.active_end,
-                    step.blocks_added,
-                    updates.size(),
-                    batch.n_tokens,
-                    std::chrono::duration<double>(iteration_finished - iteration_started).count());
+    d2f_result decode_from_file_locked(const std::string & state_path) {
+        if (state_path.empty()) {
+            throw std::invalid_argument("PD input path must not be empty");
         }
 
-        const auto generation_finished = std::chrono::steady_clock::now();
-        result.generation_seconds = std::chrono::duration<double>(
-                generation_finished - generation_started).count();
-        std::fprintf(stderr, "D2F generation_seconds=%.6f\n", result.generation_seconds);
-        if (base.print_timings) {
-            llama_perf_context_print(context.get());
-        }
-        if (result.cancelled) {
-            return result;
-        }
+        const auto state_started = std::chrono::steady_clock::now();
+        uint64_t state_bytes = 0;
+        const pd_artifact_metadata metadata = load_pd_state(state_path, state_bytes);
+        const auto state_finished = std::chrono::steady_clock::now();
+        llama_perf_context_reset(context.get());
 
-        const std::vector<int32_t> & generated = scheduler.tokens();
-        const int32_t output_length = scheduler.output_length();
-        for (int32_t i = 0; i < output_length; ++i) {
-            if (generated[i] == mask) {
-                throw std::runtime_error("D2F stopped with unresolved mask tokens");
-            }
-            result.text += token_piece(vocab, generated[i]);
-        }
-        return result;
+        d2f_result result;
+        result.image_tokens = metadata.layout.image_length;
+        result.input_tokens = metadata.layout.total_length;
+        result.state_bytes = state_bytes;
+        result.state_io_seconds =
+                std::chrono::duration<double>(state_finished - state_started).count();
+        result.decoded_from_state = true;
+        std::fprintf(
+                stderr,
+                "D2F PD decode state=%s bytes=%" PRIu64
+                " state_load_seconds=%.6f vision_model=unloaded\n",
+                state_path.c_str(),
+                result.state_bytes,
+                result.state_io_seconds);
+
+        return decode_prefix_locked(
+                metadata.layout,
+                nullptr,
+                true,
+                std::move(result),
+                state_finished);
     }
 };
 
@@ -1628,6 +2029,40 @@ d2f_result d2f_engine::generate(const d2f_request & request) {
         }
     } guard { impl_->active };
     return impl_->generate_locked(request);
+}
+
+d2f_result d2f_engine::prefill_to_file(
+        const d2f_request & request,
+        const std::string & state_path) {
+    if (!impl_) {
+        throw std::logic_error("LLaDA-o engine is not initialized");
+    }
+    std::lock_guard<std::mutex> lock(impl_->operation_mutex);
+    impl_->cancel_requested.store(false, std::memory_order_relaxed);
+    impl_->active.store(true, std::memory_order_release);
+    struct active_guard {
+        std::atomic<bool> & active;
+        ~active_guard() {
+            active.store(false, std::memory_order_release);
+        }
+    } guard { impl_->active };
+    return impl_->generate_locked(request, state_path);
+}
+
+d2f_result d2f_engine::decode_from_file(const std::string & state_path) {
+    if (!impl_) {
+        throw std::logic_error("LLaDA-o engine is not initialized");
+    }
+    std::lock_guard<std::mutex> lock(impl_->operation_mutex);
+    impl_->cancel_requested.store(false, std::memory_order_relaxed);
+    impl_->active.store(true, std::memory_order_release);
+    struct active_guard {
+        std::atomic<bool> & active;
+        ~active_guard() {
+            active.store(false, std::memory_order_release);
+        }
+    } guard { impl_->active };
+    return impl_->decode_from_file_locked(state_path);
 }
 
 void d2f_engine::set_adapter(const std::string & path, float scale) {
@@ -1685,11 +2120,18 @@ int cli_main(int argc, char ** argv) {
         request.preprocess_only = p.preprocess_only;
 
         d2f_engine engine(engine_params);
-        const d2f_result result = engine.generate(request);
+        d2f_result result;
+        if (!p.pd_decode_in.empty()) {
+            result = engine.decode_from_file(p.pd_decode_in);
+        } else if (!p.pd_prefill_out.empty()) {
+            result = engine.prefill_to_file(request, p.pd_prefill_out);
+        } else {
+            result = engine.generate(request);
+        }
         if (result.cancelled) {
             return 130;
         }
-        if (!result.preprocessed_only) {
+        if (!result.preprocessed_only && !result.prefilled_only) {
             std::fwrite(result.text.data(), 1, result.text.size(), stdout);
             std::fputc('\n', stdout);
         }

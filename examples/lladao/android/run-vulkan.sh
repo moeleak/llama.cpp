@@ -20,6 +20,8 @@ max_iterations=256
 vision_gpu=1
 preprocess_only=0
 prefix_cache=1
+pd_prefill_out=""
+pd_decode_in=""
 
 usage() {
     cat >&2 <<EOF
@@ -32,6 +34,8 @@ Options:
   --threads N              Default: 4
   --max-iterations N       Default: 256
   --no-prefix-cache        Recompute the full sequence on every D2F iteration
+  --pd-prefill-out PATH    Save prefix KV to this path on the Android device
+  --pd-decode-in PATH      Restore prefix KV from this path on the Android device
   --vision-gpu             Default: enabled
   --no-vision-gpu
   --preprocess-only
@@ -80,6 +84,14 @@ while [[ $# -gt 0 ]]; do
             prefix_cache=0
             shift
             ;;
+        --pd-prefill-out)
+            pd_prefill_out="$2"
+            shift 2
+            ;;
+        --pd-decode-in)
+            pd_decode_in="$2"
+            shift 2
+            ;;
         --vision-gpu)
             vision_gpu=1
             shift
@@ -104,8 +116,21 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ -z "${model}" || -z "${mmproj}" || -z "${image}" || -z "${prompt}" ]]; then
+if [[ -z "${model}" ]]; then
     usage
+    exit 1
+fi
+if [[ -n "${pd_prefill_out}" && -n "${pd_decode_in}" ]]; then
+    echo "--pd-prefill-out and --pd-decode-in are mutually exclusive" >&2
+    exit 1
+fi
+if [[ -z "${pd_decode_in}" &&
+      ( -z "${mmproj}" || -z "${image}" || -z "${prompt}" ) ]]; then
+    usage
+    exit 1
+fi
+if [[ -n "${pd_prefill_out}${pd_decode_in}" && "${prefix_cache}" -eq 0 ]]; then
+    echo "PD separation requires the exact prefix cache" >&2
     exit 1
 fi
 
@@ -113,7 +138,11 @@ binary="${build_dir}/bin/llama-lladao-d2f"
 backend_test="${build_dir}/bin/test-backend-ops"
 scheduler_test="${build_dir}/bin/test-diffusion-d2f-scheduler"
 mtmd_test="${build_dir}/bin/test-mtmd-lladao"
-for path in "${binary}" "${backend_test}" "${scheduler_test}" "${mtmd_test}" "${model}" "${mmproj}" "${image}"; do
+required_files=("${binary}" "${backend_test}" "${scheduler_test}" "${mtmd_test}" "${model}")
+if [[ -z "${pd_decode_in}" ]]; then
+    required_files+=("${mmproj}" "${image}")
+fi
+for path in "${required_files[@]}"; do
     if [[ ! -f "${path}" ]]; then
         echo "File not found: ${path}" >&2
         exit 1
@@ -168,8 +197,13 @@ remote_image="${remote_dir}/input-image"
 "${adb_bin}" push "${scheduler_test}" "${remote_scheduler_test}"
 "${adb_bin}" push "${mtmd_test}" "${remote_mtmd_test}"
 push_if_changed "${model}" "${remote_model}"
-push_if_changed "${mmproj}" "${remote_mmproj}"
-push_if_changed "${image}" "${remote_image}"
+if [[ -z "${pd_decode_in}" ]]; then
+    push_if_changed "${mmproj}" "${remote_mmproj}"
+    push_if_changed "${image}" "${remote_image}"
+elif ! "${adb_bin}" shell "test -f '${pd_decode_in}'"; then
+    echo "PD state not found on device: ${pd_decode_in}" >&2
+    exit 1
+fi
 if [[ -n "${lora}" ]]; then
     push_if_changed "${lora}" "${remote_lora}"
 fi
@@ -181,15 +215,25 @@ fi
 command="$(quote_android "${remote_binary}")"
 for argument in \
     --model "${remote_model}" \
-    --mmproj "${remote_mmproj}" \
-    --image "${remote_image}" \
-    --prompt "${prompt}" \
     --ctx-size "${ctx_size}" \
     --gpu-layers "${gpu_layers}" \
     --threads "${threads}" \
     --max-iterations "${max_iterations}"; do
     command+=" $(quote_android "${argument}")"
 done
+if [[ -n "${pd_decode_in}" ]]; then
+    command+=" $(quote_android "--pd-decode-in") $(quote_android "${pd_decode_in}")"
+else
+    for argument in \
+        --mmproj "${remote_mmproj}" \
+        --image "${remote_image}" \
+        --prompt "${prompt}"; do
+        command+=" $(quote_android "${argument}")"
+    done
+    if [[ -n "${pd_prefill_out}" ]]; then
+        command+=" $(quote_android "--pd-prefill-out") $(quote_android "${pd_prefill_out}")"
+    fi
+fi
 if [[ -n "${lora}" ]]; then
     command+=" $(quote_android "--lora") $(quote_android "${remote_lora}")"
 fi
