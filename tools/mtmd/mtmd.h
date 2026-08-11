@@ -99,6 +99,7 @@ struct mtmd_context_params {
     int image_min_tokens; // minimum number of tokens for image input (default: read from metadata)
     int image_max_tokens; // maximum number of tokens for image input (default: read from metadata)
     bool lladao_exact_tile; // preserve LLaDA-o tile pixels and pad to the patch size
+    int lladao_exact_tile_max_edge; // downscale larger exact tiles before padding; 0 disables
 
     // callback function passed over to mtmd proper
     ggml_backend_sched_eval_callback cb_eval;

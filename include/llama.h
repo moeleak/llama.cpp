@@ -556,6 +556,8 @@ extern "C" {
     LLAMA_API uint32_t llama_n_ubatch   (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_rs_seq   (const struct llama_context * ctx);
+    LLAMA_API enum llama_flash_attn_type llama_context_flash_attn_type(
+            const struct llama_context * ctx);
 
     DEPRECATED(LLAMA_API int32_t llama_n_ctx_train(const struct llama_model * model), "use llama_model_n_ctx_train instead");
     DEPRECATED(LLAMA_API int32_t llama_n_embd     (const struct llama_model * model), "use llama_model_n_embd instead");
@@ -789,6 +791,17 @@ extern "C" {
 
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
+
+    // Experimental: compact a fresh, contiguous single-sequence KV prefix with a per-layer, per-KV-head source-token map.
+    // The source map is flattened as [cache_layer][kv_head][kept_token].
+    LLAMA_API bool llama_kv_cache_compact_heads(
+            struct llama_context * ctx,
+                  llama_seq_id   seq_id,
+                     uint32_t   prefix_len,
+                     uint32_t   n_keep,
+              const uint32_t * src_ordinals,
+                       size_t   n_src_ordinals,
+            const llama_pos * dst_positions);
 
     //
     // State / sessions

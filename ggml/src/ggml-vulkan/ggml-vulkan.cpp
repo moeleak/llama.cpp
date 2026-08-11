@@ -15750,7 +15750,11 @@ static void ggml_backend_vk_free(ggml_backend_t backend) {
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
     VK_LOG_DEBUG("ggml_backend_vk_free(" << ctx->name << ")");
 
-    ggml_vk_cleanup(ctx);
+    try {
+        ggml_vk_cleanup(ctx);
+    } catch (const vk::DeviceLostError & e) {
+        GGML_LOG_WARN("ggml_vulkan: device lost during backend cleanup: %s\n", e.what());
+    }
 
     delete ctx;
     delete backend;

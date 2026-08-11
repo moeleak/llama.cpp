@@ -6,6 +6,7 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -770,6 +771,24 @@ uint32_t llama_context::n_threads_batch() const {
 
 llama_memory_t llama_context::get_memory() const {
     return memory.get();
+}
+
+bool llama_context::kv_cache_compact_heads(
+              llama_seq_id   seq_id,
+                 uint32_t   prefix_len,
+                 uint32_t   n_keep,
+          const uint32_t * src_ordinals,
+                   size_t   n_src_ordinals,
+        const llama_pos * dst_positions) {
+    synchronize();
+
+    auto * kv = dynamic_cast<llama_kv_cache *>(memory.get());
+    if (!kv) {
+        LLAMA_LOG_ERROR("%s: context memory is not a unified KV cache\n", __func__);
+        return false;
+    }
+
+    return kv->compact_heads(seq_id, prefix_len, n_keep, src_ordinals, n_src_ordinals, dst_positions);
 }
 
 bool llama_context::memory_update(bool optimize) {
@@ -3707,6 +3726,16 @@ uint32_t llama_n_rs_seq(const llama_context * ctx) {
     return ctx->get_cparams().n_rs_seq;
 }
 
+enum llama_flash_attn_type llama_context_flash_attn_type(const llama_context * ctx) {
+    const llama_cparams & cparams = ctx->get_cparams();
+    if (cparams.auto_fa) {
+        return LLAMA_FLASH_ATTN_TYPE_AUTO;
+    }
+    return cparams.flash_attn
+            ? LLAMA_FLASH_ATTN_TYPE_ENABLED
+            : LLAMA_FLASH_ATTN_TYPE_DISABLED;
+}
+
 const llama_model * llama_get_model(const llama_context * ctx) {
     return &ctx->get_model();
 }
@@ -4035,6 +4064,22 @@ bool llama_memory_can_shift(llama_memory_t mem) {
     }
 
     return mem->get_can_shift();
+}
+
+bool llama_kv_cache_compact_heads(
+        llama_context * ctx,
+          llama_seq_id   seq_id,
+             uint32_t   prefix_len,
+             uint32_t   n_keep,
+      const uint32_t * src_ordinals,
+               size_t   n_src_ordinals,
+    const llama_pos * dst_positions) {
+    if (!ctx) {
+        LLAMA_LOG_ERROR("%s: null context\n", __func__);
+        return false;
+    }
+
+    return ctx->kv_cache_compact_heads(seq_id, prefix_len, n_keep, src_ordinals, n_src_ordinals, dst_positions);
 }
 
 // llama state API

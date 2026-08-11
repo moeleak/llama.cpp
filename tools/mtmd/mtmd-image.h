@@ -27,6 +27,7 @@ struct mtmd_image_preproc_out {
 };
 
 clip_image_size mtmd_lladao_image_size(const clip_image_size & input_size);
+clip_image_size mtmd_lladao_exact_image_size(const clip_image_size & input_size, int max_edge);
 clip_image_size mtmd_lladao_exact_tile_size(const clip_image_size & input_size);
 clip_image_f32 mtmd_lladao_exact_tile_image(
         const clip_image_u8 & img,
@@ -132,12 +133,13 @@ struct mtmd_image_preprocessor_dyn_size : mtmd_image_preprocessor {
 };
 
 struct mtmd_image_preprocessor_lladao : mtmd_image_preprocessor {
-    mtmd_image_preprocessor_lladao(const clip_ctx * ctx, bool exact_tile = false)
-        : mtmd_image_preprocessor(ctx), exact_tile(exact_tile) {}
+    mtmd_image_preprocessor_lladao(const clip_ctx * ctx, bool exact_tile = false, int exact_tile_max_edge = 0)
+        : mtmd_image_preprocessor(ctx), exact_tile(exact_tile), exact_tile_max_edge(exact_tile_max_edge) {}
     mtmd_image_preproc_out preprocess(const clip_image_u8 & img) override;
 
 private:
     bool exact_tile;
+    int exact_tile_max_edge;
 };
 
 // similar to mtmd_image_preprocessor_dyn_size, but resize the image to have longest edge equal to hparams.image_longest_edge, while preserving aspect ratio

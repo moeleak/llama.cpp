@@ -19,6 +19,9 @@ int main() {
         if (!check(!params.lladao_exact_tile, "exact tile preprocessing is not disabled by default")) {
             return 1;
         }
+        if (!check(params.lladao_exact_tile_max_edge == 0, "exact tile downscaling is not disabled by default")) {
+            return 1;
+        }
     }
 
     {
@@ -79,6 +82,28 @@ int main() {
         }
         if (!check(actual.width <= 980 && actual.height <= 980, "dynamic image size exceeds 980")) {
             return 1;
+        }
+    }
+
+    {
+        const image_size_case exact_resize_cases[] = {
+            { { 896, 896 },   { 896, 896 } },
+            { { 895, 400 },   { 895, 400 } },
+            { { 897, 897 },   { 896, 896 } },
+            { { 1080, 2400 }, { 406, 896 } },
+            { { 2400, 1080 }, { 896, 406 } },
+        };
+        for (const image_size_case & item : exact_resize_cases) {
+            const clip_image_size actual = mtmd_lladao_exact_image_size(item.input, 896);
+            if (!check(actual.width == item.expected.width && actual.height == item.expected.height,
+                       "exact image resize mismatch")) {
+                return 1;
+            }
+            if (std::max(item.input.width, item.input.height) > 896 &&
+                !check(actual.width % 14 == 0 && actual.height % 14 == 0,
+                       "resized exact image is not patch aligned")) {
+                return 1;
+            }
         }
     }
 

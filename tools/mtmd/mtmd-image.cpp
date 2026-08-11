@@ -946,6 +946,30 @@ clip_image_size mtmd_lladao_image_size(const clip_image_size & input_size) {
     return output_size;
 }
 
+clip_image_size mtmd_lladao_exact_image_size(const clip_image_size & input_size, int max_edge) {
+    constexpr int patch_size = 14;
+
+    GGML_ASSERT(input_size.width > 0 && input_size.height > 0);
+    GGML_ASSERT(max_edge >= patch_size && max_edge % patch_size == 0);
+
+    if (std::max(input_size.width, input_size.height) <= max_edge) {
+        return input_size;
+    }
+
+    const double scale = static_cast<double>(max_edge) /
+            std::max(input_size.width, input_size.height);
+    auto scale_and_align = [scale, patch_size](int edge) {
+        const double scaled = edge * scale;
+        return std::max(
+                patch_size,
+                static_cast<int>(std::nearbyint(scaled / patch_size)) * patch_size);
+    };
+    return {
+        std::min(max_edge, scale_and_align(input_size.width)),
+        std::min(max_edge, scale_and_align(input_size.height)),
+    };
+}
+
 clip_image_size mtmd_lladao_exact_tile_size(const clip_image_size & input_size) {
     constexpr int image_max_edge = 980;
     constexpr int patch_size     = 14;
@@ -1005,7 +1029,20 @@ std::vector<int32_t> mtmd_lladao_position_ids(int patch_rows, int patch_cols) {
 
 mtmd_image_preproc_out mtmd_image_preprocessor_lladao::preprocess(const clip_image_u8 & img) {
     if (exact_tile) {
-        clip_image_f32 tile = mtmd_lladao_exact_tile_image(img, hparams.image_mean, hparams.image_std);
+        const clip_image_u8 * exact_source = &img;
+        clip_image_u8 resized_image;
+        if (exact_tile_max_edge > 0 &&
+            std::max(img.get_size().width, img.get_size().height) > exact_tile_max_edge) {
+            img_tool::resize(
+                    img,
+                    resized_image,
+                    mtmd_lladao_exact_image_size(img.get_size(), exact_tile_max_edge),
+                    RESIZE_ALGO_BICUBIC_PILLOW,
+                    PAD_NONE);
+            exact_source = &resized_image;
+        }
+        clip_image_f32 tile = mtmd_lladao_exact_tile_image(
+                *exact_source, hparams.image_mean, hparams.image_std);
         mtmd_image_preproc_out output;
         output.append(hparams, tile, false);
         return output;

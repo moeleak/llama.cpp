@@ -49,6 +49,11 @@ static void test_shifted_logits() {
     CHECK(unshifted[0].token_id == 1);
     CHECK(unshifted[1].token_id == 2);
     CHECK(unshifted[2].token_id == 0);
+
+    const auto single = diffusion_d2f_argmax_candidate(logits.data() + 6, 3);
+    CHECK(single.valid);
+    CHECK(single.token_id == shifted[0].token_id);
+    CHECK(single.confidence == shifted[0].confidence);
 }
 
 static void test_block_causal_attention() {

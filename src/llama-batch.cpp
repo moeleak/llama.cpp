@@ -295,7 +295,15 @@ bool llama_batch_allocr::init(
 
             const llama_pos p0 = memory ? memory->seq_pos_max(s) : -1;
 
-            if (p0 >= 0) {
+            if (p0 >= 0 && allow_position_gaps && seq_pos_min(s) < p0) {
+                LLAMA_LOG_ERROR(
+                        "%s: diffusion embedding positions must not move backward"
+                        " across input batches: X = %d, Y = %d\n",
+                        __func__, p0, seq_pos_min(s));
+                return false;
+            }
+
+            if (p0 >= 0 && !allow_position_gaps) {
                 bool ok = true;
 
                 if (seq_pos_min(s) != p0 + 1) {
@@ -313,6 +321,10 @@ bool llama_batch_allocr::init(
                     return false;
                 }
             }
+
+            // Diffusion embedding positions describe attention visibility, not
+            // append order. Separate prefill calls may therefore reuse one
+            // image position or jump to the next multimodal component.
 
             if (!allow_position_gaps &&
                 seq_pos_max(s) - seq_pos_min(s) + 1 > (int) seq_pos[s].size()) {

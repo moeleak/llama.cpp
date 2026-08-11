@@ -249,6 +249,7 @@ mtmd_context_params mtmd_context_params_default() {
         /* image_min_tokens  */ -1,
         /* image_max_tokens  */ -1,
         /* lladao_exact_tile */ false,
+        /* lladao_exact_tile_max_edge */ 0,
         /* cb_eval           */ nullptr,
         /* cb_eval_user_data */ nullptr,
         /* batch_max_tokens  */ 1024,
@@ -296,6 +297,7 @@ struct mtmd_context {
     std::unique_ptr<mtmd_audio_preprocessor> audio_preproc;
     std::unique_ptr<mtmd_image_preprocessor> image_preproc;
     bool lladao_exact_tile;
+    int lladao_exact_tile_max_edge;
 
     // batching
     int32_t batch_max_tokens;
@@ -312,6 +314,7 @@ struct mtmd_context {
         n_embd_text     (text_model ? llama_model_n_embd_inp(text_model) : -1),
         vocab           (text_model ? llama_model_get_vocab(text_model) : nullptr),
         lladao_exact_tile(ctx_params.lladao_exact_tile),
+        lladao_exact_tile_max_edge(ctx_params.lladao_exact_tile_max_edge),
         batch_max_tokens(ctx_params.batch_max_tokens)
     {
         if (ctx_params.image_marker != nullptr) {
@@ -320,6 +323,14 @@ struct mtmd_context {
 
         if (media_marker.empty()) {
             throw std::runtime_error("media_marker must not be empty");
+        }
+        if (lladao_exact_tile_max_edge < 0 || lladao_exact_tile_max_edge > 980 ||
+            (lladao_exact_tile_max_edge > 0 &&
+             (lladao_exact_tile_max_edge < 14 || lladao_exact_tile_max_edge % 14 != 0))) {
+            throw std::runtime_error("LLaDA-o exact tile max edge must be 0 or a multiple of 14 in [14, 980]");
+        }
+        if (lladao_exact_tile_max_edge > 0 && !lladao_exact_tile) {
+            throw std::runtime_error("LLaDA-o exact tile max edge requires exact tile preprocessing");
         }
 
         if (text_model) {
@@ -400,7 +411,8 @@ struct mtmd_context {
                 {
                     img_beg = "<|vision_start|>";
                     img_end = "<|vision_end|>";
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_lladao>(ctx_v, lladao_exact_tile);
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_lladao>(
+                            ctx_v, lladao_exact_tile, lladao_exact_tile_max_edge);
                 } break;
             case PROJECTOR_TYPE_MLP:
             case PROJECTOR_TYPE_MLP_NORM:

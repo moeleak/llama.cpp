@@ -1,12 +1,20 @@
 #include "d2f-scheduler.h"
+#include "ggml-backend.h"
 #include "ggml-cpp.h"
+#include "ggml-cpu.h"
 #include "ggml.h"
 #include "gguf.h"
+#include "lladao-d2f-decode.h"
 #include "lladao-d2f-engine.h"
+#include "lladao-d2f-kv-compression.h"
+#include "lladao-d2f-prefill.h"
+#include "lladao-d2f-qk-capture.h"
 #include "llama-cpp.h"
 #include "llama.h"
 #include "mtmd-helper.h"
+#include "mtmd-image.h"
 #include "mtmd.h"
+#include "nlohmann/json.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -29,6 +37,11 @@
 #include <utility>
 #include <vector>
 
+#if defined(__linux__) || defined(__ANDROID__)
+#include <pthread.h>
+#include <sched.h>
+#endif
+
 namespace {
 
 constexpr int32_t D2F_GENERATION_LENGTH = 64;
@@ -43,11 +56,28 @@ struct params {
     std::string retrieval_query;
     std::string pd_prefill_out;
     std::string pd_decode_in;
+    std::string input_jsonl;
+    std::string output_jsonl;
     int32_t     n_ctx          = 16384;
     int32_t     n_gpu_layers   = 999;
     int32_t     n_threads      = 0;
+    uint64_t    cpu_mask       = 0;
+    uint32_t    cpu_poll       = 50;
     int32_t     max_iterations = 256;
     int32_t     mask_token_id  = LLAMA_TOKEN_NULL;
+    int32_t     exact_image_max_edge       = 0;
+    lladao::d2f_prefix_prefill_mode prefix_prefill_mode = lladao::d2f_prefix_prefill_mode::exact;
+    int32_t     prefix_pack_size = 512;
+    int32_t     vision_kv_tile_size = 16;
+    int32_t     vision_kv_topk_tiles = 20;
+    int32_t     vision_kv_query_window = 32;
+    int32_t     vision_kv_score_layers = 4;
+    int32_t     vision_kv_pool_kernel = 7;
+    float       vision_kv_keep_ratio = 0.75f;
+    ggml_type   cache_type_k   = GGML_TYPE_F16;
+    ggml_type   cache_type_v   = GGML_TYPE_F16;
+    lladao::d2f_flash_attention_mode flash_attention_mode =
+            lladao::d2f_flash_attention_mode::auto_select;
     int32_t     full_page_tile_size       = 980;
     int32_t     tile_retrieval_topk       = 0;
     int32_t     tile_retrieval_mask_rounds = 2;
@@ -56,8 +86,14 @@ struct params {
     int8_t      vision_gpu     = -1;
     bool        full_page_tiles = false;
     bool        full_page_overview = true;
+    bool        exact_image = false;
     bool        preprocess_only = false;
     bool        prefix_cache = true;
+    bool        generation_block_cache = false;
+    bool        sparse_generation_logits = false;
+    bool        cpu_strict = false;
+    bool        release_vision_after_encode = false;
+    bool        vision_kv_compression = false;
     bool        print_timings = true;
 };
 
@@ -66,6 +102,8 @@ void print_usage(const char * program) {
             "Usage: %s --model MODEL.gguf --mmproj MMPROJ.gguf --image IMAGE "
             "--prompt GUI_INSTRUCTION [options]\n"
             "       %s --model MODEL.gguf --pd-decode-in PREFIX.state [options]\n"
+            "       %s --model MODEL.gguf --mmproj MMPROJ.gguf --input-jsonl INPUT.jsonl "
+            "--output-jsonl OUTPUT.jsonl [options]\n"
             "\n"
             "Required:\n"
             "  --model PATH          LLaDA-o language GGUF\n"
@@ -80,16 +118,55 @@ void print_usage(const char * program) {
             "  --vision-gpu          Offload the vision projector even with --gpu-layers 0\n"
             "  --no-vision-gpu       Keep the vision projector on the CPU\n"
             "  --threads N           CPU threads (default: backend choice)\n"
+            "  --cpu-mask HEX        Bind language workers to this 64-bit CPU mask; 0 disables\n"
+            "  --cpu-strict          Assign one selected CPU to each language worker\n"
+            "  --cpu-poll N          Language worker polling level, 0..100 (default: 50)\n"
             "  --max-iterations N    D2F iteration limit (default: 256)\n"
+            "  --cache-type-k TYPE   K cache type: f16 or q8_0 (default: f16)\n"
+            "  --cache-type-v TYPE   V cache type: f16 or q8_0 (default: f16)\n"
+            "  --flash-attn MODE     auto, enabled, or disabled (default: auto)\n"
             "  --no-prefix-cache     Recompute the complete sequence every D2F iteration\n"
+            "  --generation-block-cache\n"
+            "                        Reuse finalized leading generation blocks (default: disabled)\n"
+            "  --no-generation-block-cache\n"
+            "                        Disable finalized generation-block reuse\n"
+            "  --sparse-generation-logits\n"
+            "                        Request logits only for MASK rows (default: disabled)\n"
+            "  --dense-generation-logits\n"
+            "                        Request logits for every decoded generation row\n"
+            "  --prefix-prefill-mode MODE\n"
+            "                        exact, component_exact, component_parallel, or packed_image\n"
+            "                        (default: exact)\n"
+            "  --prefix-pack-size N Image chunk size for packed_image (default: 512)\n"
+            "  --vision-kv-compression\n"
+            "                        Score and compact visual KV per layer and KV head\n"
+            "  --vision-kv-tile-size N\n"
+            "                        Patch tile edge used by KV scoring (default: 16)\n"
+            "  --vision-kv-topk-tiles N\n"
+            "                        Candidate visual tiles per image; 0 keeps all (default: 20)\n"
+            "  --vision-kv-keep-ratio F\n"
+            "                        Fraction of visual patches retained per head (default: 0.75)\n"
+            "  --vision-kv-query-window N\n"
+            "                        Last prompt queries used for scoring (default: 32)\n"
+            "  --vision-kv-score-layers N\n"
+            "                        Last language layers used for scoring (default: 4)\n"
+            "  --vision-kv-pool-kernel N\n"
+            "                        Odd 2D max-pool kernel for patch scores (default: 7)\n"
+            "  --release-vision-after-encode\n"
+            "                        Release the native vision context after caching embeddings\n"
             "  --pd-prefill-out PATH Prefill the exact prefix KV state, save it, and exit\n"
             "  --pd-decode-in PATH   Restore an exact prefix KV state and decode without vision input\n"
+            "  --input-jsonl PATH    Run up to 100 validated requests through one engine\n"
+            "  --output-jsonl PATH   Write and flush one result object per batch request\n"
             "  --mask-token-id N     Override missing tokenizer mask metadata\n"
             "  --full-page-tiles     Split the original page into exact row-major tiles\n"
             "  --full-page-tile-size N\n"
             "                        Tile edge in pixels (default: 980)\n"
             "  --no-full-page-overview\n"
             "                        Do not append the native-resized whole-page overview\n"
+            "  --exact-image         Preserve image pixels and only pad to the patch grid\n"
+            "  --exact-image-max-edge N\n"
+            "                        Downscale a larger exact image before padding; 0 disables\n"
             "  --tile-retrieval-topk N\n"
             "                        Keep the Top-N source tiles; 0 keeps all (default: 0)\n"
             "  --retrieval-query TEXT\n"
@@ -100,6 +177,7 @@ void print_usage(const char * program) {
             "  --yarn-orig-ctx N     YaRN original context length (default: 16384)\n"
             "  --preprocess-only     Stop after validating multimodal layout\n"
             "  -h, --help            Show this help\n",
+            program,
             program,
             program);
 }
@@ -124,6 +202,78 @@ float parse_float(const char * flag, const char * value) {
         throw std::invalid_argument(std::string("invalid value for ") + flag + ": " + value);
     }
     return parsed;
+}
+
+bool is_supported_cache_type(ggml_type type) {
+    return type == GGML_TYPE_F16 || type == GGML_TYPE_Q8_0;
+}
+
+bool is_valid_flash_attention_mode(lladao::d2f_flash_attention_mode mode) {
+    return mode == lladao::d2f_flash_attention_mode::auto_select ||
+           mode == lladao::d2f_flash_attention_mode::disabled ||
+           mode == lladao::d2f_flash_attention_mode::enabled;
+}
+
+const char * flash_attention_mode_name(lladao::d2f_flash_attention_mode mode) {
+    switch (mode) {
+        case lladao::d2f_flash_attention_mode::auto_select: return "auto";
+        case lladao::d2f_flash_attention_mode::disabled:    return "disabled";
+        case lladao::d2f_flash_attention_mode::enabled:     return "enabled";
+    }
+    return "invalid";
+}
+
+llama_flash_attn_type to_llama_flash_attention_mode(lladao::d2f_flash_attention_mode mode) {
+    switch (mode) {
+        case lladao::d2f_flash_attention_mode::auto_select:
+            return LLAMA_FLASH_ATTN_TYPE_AUTO;
+        case lladao::d2f_flash_attention_mode::disabled:
+            return LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        case lladao::d2f_flash_attention_mode::enabled:
+            return LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    }
+    throw std::invalid_argument("invalid flash attention mode");
+}
+
+ggml_type parse_cache_type(const char * flag, const char * value) {
+    if (std::strcmp(value, "f16") == 0) {
+        return GGML_TYPE_F16;
+    }
+    if (std::strcmp(value, "q8_0") == 0) {
+        return GGML_TYPE_Q8_0;
+    }
+    throw std::invalid_argument(std::string(flag) + " must be f16 or q8_0: " + value);
+}
+
+lladao::d2f_prefix_prefill_mode parse_prefix_prefill_mode(const char * value) {
+    if (std::strcmp(value, "exact") == 0) {
+        return lladao::d2f_prefix_prefill_mode::exact;
+    }
+    if (std::strcmp(value, "component_exact") == 0) {
+        return lladao::d2f_prefix_prefill_mode::component_exact;
+    }
+    if (std::strcmp(value, "component_parallel") == 0) {
+        return lladao::d2f_prefix_prefill_mode::component_parallel;
+    }
+    if (std::strcmp(value, "packed_image") == 0) {
+        return lladao::d2f_prefix_prefill_mode::packed_image;
+    }
+    throw std::invalid_argument(
+            std::string("--prefix-prefill-mode must be exact, component_exact, component_parallel, or packed_image: ") + value);
+}
+
+lladao::d2f_flash_attention_mode parse_flash_attention_mode(const char * value) {
+    if (std::strcmp(value, "auto") == 0) {
+        return lladao::d2f_flash_attention_mode::auto_select;
+    }
+    if (std::strcmp(value, "enabled") == 0) {
+        return lladao::d2f_flash_attention_mode::enabled;
+    }
+    if (std::strcmp(value, "disabled") == 0) {
+        return lladao::d2f_flash_attention_mode::disabled;
+    }
+    throw std::invalid_argument(
+            std::string("--flash-attn must be auto, enabled, or disabled: ") + value);
 }
 
 params parse_args(int argc, char ** argv) {
@@ -157,14 +307,62 @@ params parse_args(int argc, char ** argv) {
             result.vision_gpu = 0;
         } else if (arg == "--threads" || arg == "-t") {
             result.n_threads = parse_i32(arg.c_str(), next());
+        } else if (arg == "--cpu-mask") {
+            result.cpu_mask = lladao::detail::parse_cpu_mask_hex(next());
+        } else if (arg == "--cpu-strict") {
+            result.cpu_strict = true;
+        } else if (arg == "--cpu-poll") {
+            const int32_t poll = parse_i32(arg.c_str(), next());
+            if (poll < 0 || poll > 100) {
+                throw std::invalid_argument("--cpu-poll must be in [0, 100]");
+            }
+            result.cpu_poll = static_cast<uint32_t>(poll);
         } else if (arg == "--max-iterations") {
             result.max_iterations = parse_i32(arg.c_str(), next());
+        } else if (arg == "--cache-type-k") {
+            result.cache_type_k = parse_cache_type(arg.c_str(), next());
+        } else if (arg == "--cache-type-v") {
+            result.cache_type_v = parse_cache_type(arg.c_str(), next());
+        } else if (arg == "--flash-attn") {
+            result.flash_attention_mode = parse_flash_attention_mode(next());
         } else if (arg == "--no-prefix-cache") {
             result.prefix_cache = false;
+        } else if (arg == "--generation-block-cache") {
+            result.generation_block_cache = true;
+        } else if (arg == "--no-generation-block-cache") {
+            result.generation_block_cache = false;
+        } else if (arg == "--sparse-generation-logits") {
+            result.sparse_generation_logits = true;
+        } else if (arg == "--dense-generation-logits") {
+            result.sparse_generation_logits = false;
+        } else if (arg == "--prefix-prefill-mode") {
+            result.prefix_prefill_mode = parse_prefix_prefill_mode(next());
+        } else if (arg == "--prefix-pack-size") {
+            result.prefix_pack_size = parse_i32(arg.c_str(), next());
+        } else if (arg == "--vision-kv-compression") {
+            result.vision_kv_compression = true;
+        } else if (arg == "--vision-kv-tile-size") {
+            result.vision_kv_tile_size = parse_i32(arg.c_str(), next());
+        } else if (arg == "--vision-kv-topk-tiles") {
+            result.vision_kv_topk_tiles = parse_i32(arg.c_str(), next());
+        } else if (arg == "--vision-kv-keep-ratio") {
+            result.vision_kv_keep_ratio = parse_float(arg.c_str(), next());
+        } else if (arg == "--vision-kv-query-window") {
+            result.vision_kv_query_window = parse_i32(arg.c_str(), next());
+        } else if (arg == "--vision-kv-score-layers") {
+            result.vision_kv_score_layers = parse_i32(arg.c_str(), next());
+        } else if (arg == "--vision-kv-pool-kernel") {
+            result.vision_kv_pool_kernel = parse_i32(arg.c_str(), next());
+        } else if (arg == "--release-vision-after-encode") {
+            result.release_vision_after_encode = true;
         } else if (arg == "--pd-prefill-out") {
             result.pd_prefill_out = next();
         } else if (arg == "--pd-decode-in") {
             result.pd_decode_in = next();
+        } else if (arg == "--input-jsonl") {
+            result.input_jsonl = next();
+        } else if (arg == "--output-jsonl") {
+            result.output_jsonl = next();
         } else if (arg == "--mask-token-id") {
             result.mask_token_id = parse_i32(arg.c_str(), next());
         } else if (arg == "--full-page-tiles") {
@@ -173,6 +371,10 @@ params parse_args(int argc, char ** argv) {
             result.full_page_tile_size = parse_i32(arg.c_str(), next());
         } else if (arg == "--no-full-page-overview") {
             result.full_page_overview = false;
+        } else if (arg == "--exact-image") {
+            result.exact_image = true;
+        } else if (arg == "--exact-image-max-edge") {
+            result.exact_image_max_edge = parse_i32(arg.c_str(), next());
         } else if (arg == "--tile-retrieval-topk") {
             result.tile_retrieval_topk = parse_i32(arg.c_str(), next());
             result.full_page_tiles = true;
@@ -197,13 +399,26 @@ params parse_args(int argc, char ** argv) {
     if (result.model.empty()) {
         throw std::invalid_argument("--model is required");
     }
+    if (result.input_jsonl.empty() != result.output_jsonl.empty()) {
+        throw std::invalid_argument("--input-jsonl and --output-jsonl must be provided together");
+    }
+    const bool batch_mode = !result.input_jsonl.empty();
+    if (batch_mode && (!result.image.empty() || !result.prompt.empty())) {
+        throw std::invalid_argument("batch mode and --image/--prompt are mutually exclusive");
+    }
+    if (batch_mode && (!result.pd_prefill_out.empty() || !result.pd_decode_in.empty())) {
+        throw std::invalid_argument("batch mode and PD separation are mutually exclusive");
+    }
     if (!result.pd_prefill_out.empty() && !result.pd_decode_in.empty()) {
         throw std::invalid_argument("--pd-prefill-out and --pd-decode-in are mutually exclusive");
     }
-    if (result.pd_decode_in.empty() &&
+    if (!batch_mode && result.pd_decode_in.empty() &&
         (result.mmproj.empty() || result.image.empty() || result.prompt.empty())) {
         throw std::invalid_argument(
                 "--mmproj, --image, and --prompt are required outside PD decode mode");
+    }
+    if (batch_mode && result.mmproj.empty()) {
+        throw std::invalid_argument("--mmproj is required in batch mode");
     }
     if ((!result.pd_prefill_out.empty() || !result.pd_decode_in.empty()) &&
         !result.prefix_cache) {
@@ -216,14 +431,159 @@ params parse_args(int argc, char ** argv) {
     if (result.n_ctx <= 0 || result.n_threads < 0 || result.max_iterations <= 0) {
         throw std::invalid_argument("context size, threads, and max iterations must be valid");
     }
+    if (result.cpu_poll > 100) {
+        throw std::invalid_argument("--cpu-poll must be in [0, 100]");
+    }
+    if (result.prefix_pack_size <= 0 || result.prefix_pack_size > result.n_ctx) {
+        throw std::invalid_argument("--prefix-pack-size must be in [1, --ctx-size]");
+    }
+    if (result.prefix_prefill_mode != lladao::d2f_prefix_prefill_mode::exact && !result.prefix_cache) {
+        throw std::invalid_argument("split prefix prefill modes require the prefix cache");
+    }
+    if (result.vision_kv_compression &&
+        result.prefix_prefill_mode != lladao::d2f_prefix_prefill_mode::component_parallel) {
+        throw std::invalid_argument("--vision-kv-compression requires --prefix-prefill-mode component_parallel");
+    }
+    if (result.vision_kv_compression &&
+        (!result.pd_prefill_out.empty() || !result.pd_decode_in.empty())) {
+        throw std::invalid_argument("visual KV compression is not yet compatible with PD state files");
+    }
+    if (result.vision_kv_tile_size <= 0 || result.vision_kv_topk_tiles < 0 ||
+        !(result.vision_kv_keep_ratio > 0.0f && result.vision_kv_keep_ratio <= 1.0f) ||
+        result.vision_kv_query_window < 0 || result.vision_kv_score_layers <= 0 ||
+        result.vision_kv_pool_kernel <= 0 || result.vision_kv_pool_kernel % 2 == 0) {
+        throw std::invalid_argument("invalid visual KV compression parameters");
+    }
+    if (result.cache_type_v == GGML_TYPE_Q8_0 &&
+        result.flash_attention_mode != lladao::d2f_flash_attention_mode::enabled) {
+        throw std::invalid_argument("q8_0 V cache requires --flash-attn enabled");
+    }
     if (result.full_page_tile_size <= 0 || result.full_page_tile_size > 980) {
         throw std::invalid_argument("--full-page-tile-size must be in [1, 980]");
     }
     if (result.tile_retrieval_topk < 0 || result.tile_retrieval_mask_rounds <= 0) {
         throw std::invalid_argument("retrieval Top-K and mask rounds must be valid");
     }
+    if (result.exact_image && result.full_page_tiles) {
+        throw std::invalid_argument("--exact-image and --full-page-tiles are mutually exclusive");
+    }
+    if (result.exact_image_max_edge < 0 || result.exact_image_max_edge > 980 ||
+        (result.exact_image_max_edge > 0 &&
+         (result.exact_image_max_edge < 14 || result.exact_image_max_edge % 14 != 0))) {
+        throw std::invalid_argument("--exact-image-max-edge must be 0 or a multiple of 14 in [14, 980]");
+    }
+    if (result.exact_image_max_edge > 0 && !result.exact_image) {
+        throw std::invalid_argument("--exact-image-max-edge requires --exact-image");
+    }
     if (result.yarn_factor < 1.0f || result.yarn_orig_ctx <= 0) {
         throw std::invalid_argument("YaRN factor and original context must be valid");
+    }
+    return result;
+}
+
+using json = nlohmann::ordered_json;
+
+struct batch_input {
+    std::string id;
+    std::string image;
+    std::string prompt;
+    std::string retrieval_query;
+    std::string image_cache_key;
+};
+
+bool is_batch_input_field(const std::string & field) {
+    return field == "id" || field == "image" || field == "prompt" ||
+           field == "retrieval_query" || field == "image_cache_key";
+}
+
+std::string read_batch_string(
+        const json & record,
+        const char * field,
+        size_t line_number,
+        bool required) {
+    const auto found = record.find(field);
+    if (found == record.end()) {
+        if (required) {
+            throw std::invalid_argument(
+                    "batch input line " + std::to_string(line_number) +
+                    " is missing string field " + field);
+        }
+        return {};
+    }
+    if (!found->is_string()) {
+        throw std::invalid_argument(
+                "batch input line " + std::to_string(line_number) +
+                " field " + field + " must be a string");
+    }
+    const std::string value = found->get<std::string>();
+    if (required && value.empty()) {
+        throw std::invalid_argument(
+                "batch input line " + std::to_string(line_number) +
+                " field " + field + " must not be empty");
+    }
+    return value;
+}
+
+std::vector<batch_input> read_batch_inputs(const std::string & path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        throw std::runtime_error("failed to open batch input: " + path);
+    }
+
+    std::vector<batch_input> result;
+    std::unordered_map<std::string, size_t> id_lines;
+    std::string line;
+    size_t line_number = 0;
+    while (std::getline(input, line)) {
+        ++line_number;
+        if (line.empty()) {
+            throw std::invalid_argument(
+                    "batch input line " + std::to_string(line_number) + " must not be empty");
+        }
+        if (result.size() == 100) {
+            throw std::invalid_argument("batch input must contain at most 100 requests");
+        }
+
+        json record;
+        try {
+            record = json::parse(line);
+        } catch (const json::exception & error) {
+            throw std::invalid_argument(
+                    "invalid JSON on batch input line " + std::to_string(line_number) +
+                    ": " + error.what());
+        }
+        if (!record.is_object()) {
+            throw std::invalid_argument(
+                    "batch input line " + std::to_string(line_number) + " must be a JSON object");
+        }
+        for (const auto & entry : record.items()) {
+            if (!is_batch_input_field(entry.key())) {
+                throw std::invalid_argument(
+                        "batch input line " + std::to_string(line_number) +
+                        " has unknown field " + entry.key());
+            }
+        }
+
+        batch_input request;
+        request.id = read_batch_string(record, "id", line_number, true);
+        request.image = read_batch_string(record, "image", line_number, true);
+        request.prompt = read_batch_string(record, "prompt", line_number, true);
+        request.retrieval_query = read_batch_string(record, "retrieval_query", line_number, false);
+        request.image_cache_key = read_batch_string(record, "image_cache_key", line_number, false);
+        const auto inserted = id_lines.emplace(request.id, line_number);
+        if (!inserted.second) {
+            throw std::invalid_argument(
+                    "duplicate batch id " + request.id + " on lines " +
+                    std::to_string(inserted.first->second) + " and " +
+                    std::to_string(line_number));
+        }
+        result.push_back(std::move(request));
+    }
+    if (input.bad()) {
+        throw std::runtime_error("failed while reading batch input: " + path);
+    }
+    if (result.empty()) {
+        throw std::invalid_argument("batch input must contain at least one request");
     }
     return result;
 }
@@ -374,6 +734,8 @@ class token_embedding_reader {
 struct encoded_image {
     std::vector<float> embeddings;
     int32_t n_tokens = 0;
+    int32_t grid_width = 0;
+    int32_t grid_height = 0;
     int32_t source_index = 0;
     llama_pos dense_position = 0;
     bool overview = false;
@@ -406,7 +768,9 @@ bitmap_ptr load_image(mtmd_context * mctx, const std::string & image_path) {
 encoded_image encode_bitmap(
         mtmd_context * mctx,
         const mtmd_bitmap * bitmap,
-        int32_t n_embd) {
+        int32_t n_embd,
+        bool exact_image = false,
+        int32_t exact_image_max_edge = 0) {
     mtmd::input_chunks chunks(mtmd_input_chunks_init());
     if (!chunks.ptr) {
         throw std::runtime_error("failed to allocate multimodal chunks");
@@ -453,6 +817,25 @@ encoded_image encode_bitmap(
 
     encoded_image result;
     result.n_tokens = static_cast<int32_t>(n_image_tokens);
+    clip_image_size processed_size = {
+        static_cast<int>(mtmd_bitmap_get_nx(bitmap)),
+        static_cast<int>(mtmd_bitmap_get_ny(bitmap)),
+    };
+    if (exact_image) {
+        if (exact_image_max_edge > 0 &&
+            std::max(processed_size.width, processed_size.height) > exact_image_max_edge) {
+            processed_size = mtmd_lladao_exact_image_size(processed_size, exact_image_max_edge);
+        }
+        processed_size = mtmd_lladao_exact_tile_size(processed_size);
+    } else {
+        processed_size = mtmd_lladao_image_size(processed_size);
+    }
+    result.grid_width = processed_size.width / 14;
+    result.grid_height = processed_size.height / 14;
+    if (result.grid_width <= 0 || result.grid_height <= 0 ||
+        static_cast<int64_t>(result.grid_width) * result.grid_height != result.n_tokens) {
+        throw std::runtime_error("vision patch grid does not match the encoded token count");
+    }
     result.embeddings.assign(
             output, output + static_cast<size_t>(result.n_tokens) * static_cast<size_t>(n_embd));
     return result;
@@ -461,9 +844,15 @@ encoded_image encode_bitmap(
 encoded_image encode_image(
         mtmd_context * mctx,
         const std::string & image_path,
-        int32_t n_embd) {
+        int32_t n_embd,
+        bool exact_image,
+        int32_t exact_image_max_edge) {
     const bitmap_ptr bitmap = load_image(mctx, image_path);
-    return encode_bitmap(mctx, bitmap.get(), n_embd);
+    if (exact_image && exact_image_max_edge == 0 &&
+        (mtmd_bitmap_get_nx(bitmap.get()) > 980 || mtmd_bitmap_get_ny(bitmap.get()) > 980)) {
+        throw std::invalid_argument("exact image dimensions must not exceed 980 pixels");
+    }
+    return encode_bitmap(mctx, bitmap.get(), n_embd, exact_image, exact_image_max_edge);
 }
 
 std::vector<tile_box> full_page_tile_boxes(
@@ -530,6 +919,7 @@ bitmap_ptr crop_bitmap(const mtmd_bitmap * bitmap, const tile_box & box) {
 struct prefix {
     std::vector<float> embeddings;
     std::vector<llama_pos> positions;
+    std::vector<int32_t> image_lengths;
     int32_t image_length = 0;
     int32_t total_length = 0;
     llama_pos generation_position = 0;
@@ -556,11 +946,18 @@ struct pd_artifact_metadata {
     bool has_adapter = false;
     float adapter_scale = 1.0f;
     uint64_t adapter_size = 0;
+    ggml_type cache_type_k = GGML_TYPE_F16;
+    ggml_type cache_type_v = GGML_TYPE_F16;
+    lladao::d2f_prefix_prefill_mode prefix_prefill_mode =
+            lladao::d2f_prefix_prefill_mode::exact;
+    int32_t prefix_pack_size = 512;
+    lladao::d2f_flash_attention_mode flash_attention_mode =
+            lladao::d2f_flash_attention_mode::auto_select;
 };
 
 constexpr uint32_t D2F_PD_MAGIC = 0x32445044U;
-constexpr int32_t D2F_PD_VERSION = 1;
-constexpr size_t D2F_PD_METADATA_TOKENS = 23;
+constexpr int32_t D2F_PD_VERSION = 3;
+constexpr size_t D2F_PD_METADATA_TOKENS = 28;
 
 llama_token bits_to_token(uint32_t bits) {
     llama_token token;
@@ -636,6 +1033,11 @@ std::vector<llama_token> encode_pd_metadata(const pd_artifact_metadata & metadat
     tokens.push_back(metadata.has_adapter ? 1 : 0);
     tokens.push_back(float_to_token(metadata.adapter_scale));
     append_u64(tokens, metadata.adapter_size);
+    tokens.push_back(static_cast<llama_token>(metadata.cache_type_k));
+    tokens.push_back(static_cast<llama_token>(metadata.cache_type_v));
+    tokens.push_back(static_cast<llama_token>(metadata.prefix_prefill_mode));
+    tokens.push_back(metadata.prefix_pack_size);
+    tokens.push_back(static_cast<llama_token>(metadata.flash_attention_mode));
     if (tokens.size() != D2F_PD_METADATA_TOKENS) {
         throw std::logic_error("PD metadata layout is inconsistent");
     }
@@ -670,6 +1072,11 @@ pd_artifact_metadata decode_pd_metadata(const std::vector<llama_token> & tokens)
     metadata.has_adapter = tokens[19] != 0;
     metadata.adapter_scale = token_to_float(tokens[20]);
     metadata.adapter_size = read_u64(tokens, 21);
+    metadata.cache_type_k = static_cast<ggml_type>(tokens[23]);
+    metadata.cache_type_v = static_cast<ggml_type>(tokens[24]);
+    metadata.prefix_prefill_mode = static_cast<lladao::d2f_prefix_prefill_mode>(tokens[25]);
+    metadata.prefix_pack_size = tokens[26];
+    metadata.flash_attention_mode = static_cast<lladao::d2f_flash_attention_mode>(tokens[27]);
 
     if (metadata.layout.image_length <= 0 ||
         metadata.layout.total_length < metadata.layout.image_length ||
@@ -678,6 +1085,11 @@ pd_artifact_metadata decode_pd_metadata(const std::vector<llama_token> & tokens)
         metadata.layout.total_length > std::numeric_limits<int32_t>::max() - D2F_GENERATION_LENGTH ||
         metadata.n_vocab <= 0 || metadata.n_embd <= 0 ||
         metadata.yarn_orig_ctx <= 0 || metadata.yarn_factor < 1.0f ||
+        !is_supported_cache_type(metadata.cache_type_k) ||
+        !is_supported_cache_type(metadata.cache_type_v) ||
+        !lladao::detail::prefix_prefill_mode_valid(metadata.prefix_prefill_mode) ||
+        metadata.prefix_pack_size <= 0 ||
+        !is_valid_flash_attention_mode(metadata.flash_attention_mode) ||
         !std::isfinite(metadata.yarn_factor) || !std::isfinite(metadata.adapter_scale)) {
         throw std::runtime_error("PD state metadata is invalid");
     }
@@ -733,6 +1145,7 @@ prefix build_prefix(
     result.positions.reserve(prefix_tokens);
 
     for (const encoded_image * image : images) {
+        result.image_lengths.push_back(image->n_tokens + 2);
         append_embedding(result.embeddings, token_embeddings.get(vision_start));
         result.positions.push_back(image->dense_position);
         result.embeddings.insert(
@@ -754,6 +1167,109 @@ prefix build_prefix(
     result.total_length        = static_cast<int32_t>(result.positions.size());
     result.generation_position = position;
     return result;
+}
+
+lladao::detail::d2f_visual_prefix_layout build_visual_prefix_layout(
+        const std::vector<const encoded_image *> & images,
+        const prefix & input_prefix,
+        llama_pos prompt_position) {
+    lladao::detail::d2f_visual_prefix_layout result;
+    int32_t token_start = 0;
+    for (const encoded_image * image : images) {
+        if (!image || image->n_tokens <= 0 || image->grid_width <= 0 || image->grid_height <= 0 ||
+            static_cast<int64_t>(image->grid_width) * image->grid_height != image->n_tokens) {
+            throw std::logic_error("invalid encoded image in visual KV prefix layout");
+        }
+        const int32_t token_end = token_start + image->n_tokens + 2;
+        result.spans.push_back({
+            token_start,
+            token_end,
+            token_start + 1,
+            token_end - 1,
+            image->grid_height,
+            image->grid_width,
+            image->dense_position,
+        });
+        token_start = token_end;
+    }
+    if (token_start != input_prefix.image_length) {
+        throw std::logic_error("visual spans do not match the input prefix");
+    }
+    result.prompt_start = input_prefix.image_length;
+    result.prefix_length = input_prefix.total_length;
+    result.prompt_position = prompt_position;
+    return result;
+}
+
+lladao::detail::d2f_visual_kv_keep_plan build_visual_kv_keep_plan_from_capture(
+        const lladao::detail::d2f_post_rope_qk_capture & capture,
+        const llama_model * model,
+        const lladao::detail::d2f_visual_prefix_layout & layout,
+        const lladao::detail::d2f_visual_kv_compression_config & config) {
+    const int32_t n_layer = llama_model_n_layer(model);
+    const int32_t n_head = llama_model_n_head(model);
+    const int32_t n_head_kv = llama_model_n_head_kv(model);
+    const int32_t n_embd = llama_model_n_embd_inp(model);
+    if (n_layer <= 0 || n_head <= 0 || n_head_kv <= 0 || n_embd % n_head != 0) {
+        throw std::logic_error("invalid model dimensions for visual KV scoring");
+    }
+    const int32_t head_dim = n_embd / n_head;
+    const int32_t prompt_tokens = layout.prefix_length - layout.prompt_start;
+    const std::vector<int32_t> layers = lladao::detail::select_visual_score_layers(
+            n_layer,
+            config.vision_score_layers,
+            config.vision_score_layer_mode);
+    std::vector<lladao::detail::d2f_visual_layer_scores> scores;
+    scores.reserve(layers.size());
+
+    for (int32_t layer : layers) {
+        const auto * image_key = capture.find(
+                lladao::detail::d2f_qk_capture_phase::image,
+                lladao::detail::d2f_qk_tensor_kind::key,
+                layer);
+        const auto * prompt_query = capture.find(
+                lladao::detail::d2f_qk_capture_phase::prompt,
+                lladao::detail::d2f_qk_tensor_kind::query,
+                layer);
+        const auto * prompt_key = capture.find(
+                lladao::detail::d2f_qk_capture_phase::prompt,
+                lladao::detail::d2f_qk_tensor_kind::key,
+                layer);
+        if (!image_key || !prompt_query || !prompt_key ||
+            image_key->shape.tokens != layout.prompt_start ||
+            image_key->shape.heads != n_head_kv || image_key->shape.head_dim != head_dim ||
+            prompt_query->shape.tokens != prompt_tokens ||
+            prompt_query->shape.heads != n_head || prompt_query->shape.head_dim != head_dim ||
+            prompt_key->shape.tokens != prompt_tokens ||
+            prompt_key->shape.heads != n_head_kv || prompt_key->shape.head_dim != head_dim) {
+            throw std::runtime_error("captured post-RoPE Q/K does not match the visual prefix layout");
+        }
+
+        std::vector<float> prefix_key;
+        prefix_key.reserve(image_key->values.size() + prompt_key->values.size());
+        prefix_key.insert(prefix_key.end(), image_key->values.begin(), image_key->values.end());
+        prefix_key.insert(prefix_key.end(), prompt_key->values.begin(), prompt_key->values.end());
+        scores.push_back(lladao::detail::compute_visual_attention_scores(
+                {
+                    layer,
+                    prompt_tokens,
+                    layout.prefix_length,
+                    n_head,
+                    n_head_kv,
+                    head_dim,
+                    1.0f / std::sqrt(static_cast<float>(head_dim)),
+                    prompt_query->values.data(),
+                    prefix_key.data(),
+                },
+                layout,
+                config.vision_score_query_window));
+    }
+
+    return lladao::detail::build_visual_kv_keep_plan(
+            n_layer,
+            layout,
+            std::move(scores),
+            config);
 }
 
 class batch_owner {
@@ -808,7 +1324,12 @@ double same_position_cross_entropy(
     return static_cast<double>(maximum) + std::log(exponential_sum) - logits[target];
 }
 
-double score_image_with_masked_query(
+struct masked_query_score {
+    double value = 0.0;
+    bool cancelled = false;
+};
+
+masked_query_score score_image_with_masked_query(
         llama_context * context,
         batch_owner & owned_batch,
         token_embedding_reader & token_embeddings,
@@ -820,7 +1341,8 @@ double score_image_with_masked_query(
         llama_pos query_position,
         int32_t mask_rounds,
         int32_t n_embd,
-        int32_t n_vocab) {
+        int32_t n_vocab,
+        const std::atomic<bool> & cancel_requested) {
     if (clean_query.size() < 3) {
         throw std::invalid_argument("retrieval query must contain at least one non-boundary token");
     }
@@ -833,6 +1355,11 @@ double score_image_with_masked_query(
     int32_t scored_tokens = 0;
 
     for (int32_t round = 0; round < effective_rounds; ++round) {
+        if (cancel_requested.load(std::memory_order_relaxed)) {
+            masked_query_score result;
+            result.cancelled = true;
+            return result;
+        }
         std::vector<int32_t> target_indices;
         for (int32_t query_index = 1 + round;
              query_index < query_length - 1;
@@ -882,6 +1409,11 @@ double score_image_with_masked_query(
         llama_memory_clear(llama_get_memory(context), true);
         const int32_t decode_result = llama_decode(context, batch);
         if (decode_result != 0) {
+            if (decode_result == 2 && cancel_requested.load(std::memory_order_relaxed)) {
+                masked_query_score result;
+                result.cancelled = true;
+                return result;
+            }
             throw std::runtime_error(
                     "masked-query llama_decode failed with code " +
                     std::to_string(decode_result));
@@ -902,13 +1434,16 @@ double score_image_with_masked_query(
                 "complementary mask rounds scored " + std::to_string(scored_tokens) +
                 " tokens, expected " + std::to_string(expected_tokens));
     }
-    return -loss_sum / static_cast<double>(scored_tokens);
+    masked_query_score result;
+    result.value = -loss_sum / static_cast<double>(scored_tokens);
+    return result;
 }
 
 struct retrieval_result {
     std::vector<double> scores;
     std::vector<int32_t> selected_source_indices;
     double latency_seconds = 0.0;
+    bool cancelled = false;
 };
 
 retrieval_result retrieve_image_tiles(
@@ -924,7 +1459,8 @@ retrieval_result retrieve_image_tiles(
         int32_t topk,
         int32_t mask_rounds,
         int32_t n_embd,
-        int32_t n_vocab) {
+        int32_t n_vocab,
+        const std::atomic<bool> & cancel_requested) {
     if (topk <= 0) {
         throw std::invalid_argument("tile retrieval Top-K must be positive");
     }
@@ -933,7 +1469,7 @@ retrieval_result retrieve_image_tiles(
     retrieval_result result;
     result.scores.reserve(source_images.size());
     for (const encoded_image & image : source_images) {
-        const double score = score_image_with_masked_query(
+        const masked_query_score score = score_image_with_masked_query(
                 context,
                 owned_batch,
                 token_embeddings,
@@ -945,16 +1481,21 @@ retrieval_result retrieve_image_tiles(
                 query_position,
                 mask_rounds,
                 n_embd,
-                n_vocab);
-        if (!std::isfinite(score)) {
+                n_vocab,
+                cancel_requested);
+        if (score.cancelled) {
+            result.cancelled = true;
+            return result;
+        }
+        if (!std::isfinite(score.value)) {
             throw std::runtime_error("masked-query tile score is not finite");
         }
-        result.scores.push_back(score);
+        result.scores.push_back(score.value);
         std::fprintf(
                 stderr,
                 "tile_retrieval score source=%" PRId32 " value=%.8f\n",
                 image.source_index,
-                score);
+                score.value);
     }
 
     std::vector<int32_t> rank(source_images.size());
@@ -983,16 +1524,19 @@ void fill_batch(
         llama_batch & batch,
         const prefix & input_prefix,
         const std::vector<int32_t> & generation_tokens,
-        int32_t active_generation_length,
+        const lladao::detail::d2f_generation_decode_plan & plan,
         token_embedding_reader & token_embeddings,
         int32_t n_embd) {
-    const int32_t n_tokens = input_prefix.total_length + active_generation_length;
+    if (plan.first_position != 0) {
+        throw std::logic_error("full-sequence D2F batch must start at generation position zero");
+    }
+    const int32_t n_tokens = input_prefix.total_length + plan.active_end;
     initialize_batch_rows(batch, n_tokens);
 
     std::copy(input_prefix.embeddings.begin(), input_prefix.embeddings.end(), batch.embd);
     std::copy(input_prefix.positions.begin(), input_prefix.positions.end(), batch.pos);
 
-    for (int32_t i = 0; i < active_generation_length; ++i) {
+    for (int32_t i = 0; i < plan.active_end; ++i) {
         const std::vector<float> & embedding = token_embeddings.get(generation_tokens[i]);
         std::copy(
                 embedding.begin(),
@@ -1001,49 +1545,86 @@ void fill_batch(
         batch.pos[input_prefix.total_length + i] = input_prefix.generation_position + i;
     }
 
-    for (int32_t i = 0; i < active_generation_length; ++i) {
-        // Same-position D2F decoding only consumes generation logits. Avoid
-        // materializing a vocabulary row for every selected visual token.
-        batch.logits[input_prefix.total_length + i] = 1;
+    for (int32_t position : plan.logit_positions) {
+        batch.logits[input_prefix.total_length + position] = 1;
     }
 }
 
-void fill_prefix_batch(
+void fill_prefix_batch_range(
         llama_batch & batch,
-        const prefix & input_prefix) {
-    initialize_batch_rows(batch, input_prefix.total_length);
-    std::copy(input_prefix.embeddings.begin(), input_prefix.embeddings.end(), batch.embd);
-    std::copy(input_prefix.positions.begin(), input_prefix.positions.end(), batch.pos);
-    batch.logits[input_prefix.total_length - 1] = 1;
+        const prefix & input_prefix,
+        int32_t offset,
+        int32_t length,
+        int32_t n_embd) {
+    if (offset < 0 || length <= 0 || offset > input_prefix.total_length - length) {
+        throw std::invalid_argument("prefix chunk is outside the encoded prefix");
+    }
+    initialize_batch_rows(batch, length);
+    const size_t embedding_offset = static_cast<size_t>(offset) * n_embd;
+    const size_t embedding_count = static_cast<size_t>(length) * n_embd;
+    std::copy_n(
+            input_prefix.embeddings.data() + embedding_offset,
+            embedding_count,
+            batch.embd);
+    std::copy_n(input_prefix.positions.data() + offset, length, batch.pos);
+    batch.logits[length - 1] = 1;
 }
 
 void fill_generation_batch(
         llama_batch & batch,
         llama_pos generation_position,
         const std::vector<int32_t> & generation_tokens,
-        int32_t active_generation_length,
+        const lladao::detail::d2f_generation_decode_plan & plan,
         token_embedding_reader & token_embeddings,
         int32_t n_embd) {
-    initialize_batch_rows(batch, active_generation_length);
-    for (int32_t i = 0; i < active_generation_length; ++i) {
-        const std::vector<float> & embedding = token_embeddings.get(generation_tokens[i]);
+    initialize_batch_rows(batch, plan.input_rows());
+    for (int32_t position = plan.first_position; position < plan.active_end; ++position) {
+        const int32_t row = position - plan.first_position;
+        const std::vector<float> & embedding = token_embeddings.get(generation_tokens[position]);
         std::copy(
                 embedding.begin(),
                 embedding.end(),
-                batch.embd + static_cast<size_t>(i) * n_embd);
-        batch.pos[i] = generation_position + i;
-        batch.logits[i] = 1;
+                batch.embd + static_cast<size_t>(row) * n_embd);
+        batch.pos[row] = generation_position + position;
+        batch.logits[row] = plan.requests_logits(position) ? 1 : 0;
     }
+}
+
+std::vector<diffusion_d2f_candidate> collect_generation_candidates(
+        llama_context * context,
+        const lladao::detail::d2f_generation_decode_plan & plan,
+        const std::vector<int32_t> & generation_tokens,
+        llama_token mask_token_id,
+        int32_t batch_prefix_rows,
+        int32_t generation_length,
+        int32_t n_vocab) {
+    std::vector<diffusion_d2f_candidate> result(generation_length);
+    for (int32_t position = plan.active_start; position < plan.active_end; ++position) {
+        if (generation_tokens[position] != mask_token_id) {
+            continue;
+        }
+        const int32_t batch_index = plan.batch_index(position, batch_prefix_rows);
+        const float * logits = llama_get_logits_ith(context, batch_index);
+        if (!logits) {
+            throw std::runtime_error(
+                    "language model returned no logits for D2F batch row " +
+                    std::to_string(batch_index));
+        }
+        result[position] = diffusion_d2f_argmax_candidate(logits, n_vocab);
+    }
+    return result;
 }
 
 mtmd::context_ptr make_vision_context(
         const params & p,
         llama_model * model,
-        bool exact_tile) {
+        bool exact_tile,
+        int32_t exact_tile_max_edge) {
     mtmd_context_params mtmd_params = mtmd_context_params_default();
     mtmd_params.use_gpu = p.vision_gpu < 0 ? p.n_gpu_layers > 0 : p.vision_gpu != 0;
     mtmd_params.print_timings = p.print_timings;
     mtmd_params.lladao_exact_tile = exact_tile;
+    mtmd_params.lladao_exact_tile_max_edge = exact_tile_max_edge;
     if (p.n_threads > 0) {
         mtmd_params.n_threads = p.n_threads;
     }
@@ -1071,7 +1652,7 @@ full_page_images encode_full_page(
         const params & p,
         llama_model * model,
         int32_t n_embd) {
-    mtmd::context_ptr native_context = make_vision_context(p, model, false);
+    mtmd::context_ptr native_context = make_vision_context(p, model, false, 0);
     bitmap_ptr page = load_image(native_context.get(), p.image);
 
     full_page_images result;
@@ -1081,19 +1662,19 @@ full_page_images encode_full_page(
     if (p.full_page_overview) {
         result.overview =
                 std::make_unique<encoded_image>(
-                        encode_bitmap(native_context.get(), page.get(), n_embd));
+                        encode_bitmap(native_context.get(), page.get(), n_embd, false, 0));
         result.overview->overview = true;
     }
     native_context.reset();
 
     const std::vector<tile_box> boxes =
             full_page_tile_boxes(result.width, result.height, p.full_page_tile_size);
-    mtmd::context_ptr exact_context = make_vision_context(p, model, true);
+    mtmd::context_ptr exact_context = make_vision_context(p, model, true, 0);
     result.sources.reserve(boxes.size());
     llama_pos dense_position = 0;
     for (size_t index = 0; index < boxes.size(); ++index) {
         const bitmap_ptr tile = crop_bitmap(page.get(), boxes[index]);
-        encoded_image image = encode_bitmap(exact_context.get(), tile.get(), n_embd);
+        encoded_image image = encode_bitmap(exact_context.get(), tile.get(), n_embd, true, 0);
         image.source_index = static_cast<int32_t>(index);
         image.dense_position = dense_position;
         dense_position += image.n_tokens + 2;
@@ -1230,8 +1811,70 @@ void print_layout(
 
 namespace lladao {
 
+namespace detail {
+
+uint64_t parse_cpu_mask_hex(const char * value) {
+    if (value == nullptr) {
+        throw std::invalid_argument("--cpu-mask must be a hexadecimal integer");
+    }
+    const std::string text(value);
+    size_t offset = 0;
+    if (text.size() >= 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
+        offset = 2;
+    }
+    if (offset == text.size()) {
+        throw std::invalid_argument("--cpu-mask must be a hexadecimal integer: " + text);
+    }
+
+    uint64_t result = 0;
+    for (size_t i = offset; i < text.size(); ++i) {
+        const char c = text[i];
+        uint64_t digit = 0;
+        if (c >= '0' && c <= '9') {
+            digit = static_cast<uint64_t>(c - '0');
+        } else if (c >= 'a' && c <= 'f') {
+            digit = static_cast<uint64_t>(c - 'a' + 10);
+        } else if (c >= 'A' && c <= 'F') {
+            digit = static_cast<uint64_t>(c - 'A' + 10);
+        } else {
+            throw std::invalid_argument("--cpu-mask must be a hexadecimal integer: " + text);
+        }
+        if (result > (std::numeric_limits<uint64_t>::max() - digit) / 16) {
+            throw std::invalid_argument("--cpu-mask exceeds 64 bits: " + text);
+        }
+        result = result * 16 + digit;
+    }
+    return result;
+}
+
+std::string format_cpu_mask(uint64_t mask) {
+    char buffer[2 + 16 + 1];
+    std::snprintf(buffer, sizeof(buffer), "0x%" PRIx64, mask);
+    return buffer;
+}
+
+int32_t resolve_cpu_threads(uint64_t mask, int32_t requested_threads) {
+    if (mask == 0 || requested_threads != 0) {
+        return requested_threads;
+    }
+    int32_t selected = 0;
+    while (mask != 0) {
+        selected += static_cast<int32_t>(mask & 1U);
+        mask >>= 1U;
+    }
+    return selected;
+}
+
+const char * language_device_mode(int32_t gpu_layers) {
+    return gpu_layers == 0 ? "cpu_only" : "automatic";
+}
+
+} // namespace detail
+
 struct d2f_engine::impl {
     params base;
+    int32_t cpu_threads_requested = 0;
+    std::vector<ggml_backend_dev_t> language_devices;
     llama_model_ptr model;
     const llama_vocab * vocab = nullptr;
     int32_t n_vocab = 0;
@@ -1242,19 +1885,91 @@ struct d2f_engine::impl {
     llama_token vision_start = LLAMA_TOKEN_NULL;
     llama_token vision_end = LLAMA_TOKEN_NULL;
     std::unique_ptr<token_embedding_reader> token_embeddings;
+    std::unique_ptr<lladao::detail::d2f_post_rope_qk_capture> qk_capture;
     mtmd::context_ptr native_vision;
+    bool native_vision_exact = false;
     std::unique_ptr<encoded_image> cached_native_image;
     std::string cached_native_image_key;
+    bool cached_native_image_exact = false;
     llama_adapter_lora_ptr adapter;
     std::string adapter_path;
     float adapter_scale = 1.0f;
-    llama_context_ptr context;
-    std::unique_ptr<batch_owner> owned_batch;
-    int32_t batch_capacity = 0;
-    int32_t output_capacity = 0;
     std::atomic<bool> cancel_requested { false };
     std::atomic<bool> active { false };
+    llama_context_ptr context;
+    ggml_threadpool_t cpu_threadpool = nullptr;
+    decltype(ggml_threadpool_free) * cpu_threadpool_free_fn = nullptr;
+    decltype(ggml_threadpool_pause) * cpu_threadpool_pause_fn = nullptr;
+    std::unique_ptr<batch_owner> owned_batch;
+    int32_t batch_capacity = 0;
+    int32_t resident_capacity = 0;
+    int32_t output_capacity = 0;
     std::mutex operation_mutex;
+
+    struct operation_affinity_guard {
+        impl & owner;
+#if defined(__linux__) || defined(__ANDROID__)
+        cpu_set_t inherited_affinity {};
+        bool inherited_affinity_valid = false;
+#endif
+
+        explicit operation_affinity_guard(impl & value) : owner(value) {
+            if (owner.active_operation_affinity != nullptr) {
+                throw std::logic_error("nested D2F affinity scope");
+            }
+            owner.active_operation_affinity = this;
+        }
+
+        void capture_before_language_decode() {
+#if defined(__linux__) || defined(__ANDROID__)
+            if (owner.base.cpu_mask == 0 || inherited_affinity_valid) {
+                return;
+            }
+#if defined(__ANDROID__)
+            if (sched_getaffinity(
+                        0,
+                        sizeof(inherited_affinity),
+                        &inherited_affinity) != 0) {
+                throw std::runtime_error("failed to capture caller CPU affinity before language decode");
+            }
+#else
+            if (pthread_getaffinity_np(
+                        pthread_self(),
+                        sizeof(inherited_affinity),
+                        &inherited_affinity) != 0) {
+                throw std::runtime_error("failed to capture caller CPU affinity before language decode");
+            }
+#endif
+            inherited_affinity_valid = true;
+            std::fprintf(
+                    stderr,
+                    "D2F language affinity activated immediately before decode mask=%s\n",
+                    lladao::detail::format_cpu_mask(owner.base.cpu_mask).c_str());
+#endif
+        }
+
+        ~operation_affinity_guard() {
+            owner.pause_cpu_threadpool();
+#if defined(__linux__) || defined(__ANDROID__)
+            if (inherited_affinity_valid &&
+#if defined(__ANDROID__)
+                sched_setaffinity(
+                        0,
+                        sizeof(inherited_affinity),
+                        &inherited_affinity) != 0) {
+#else
+                pthread_setaffinity_np(
+                        pthread_self(),
+                        sizeof(inherited_affinity),
+                        &inherited_affinity) != 0) {
+#endif
+                std::fprintf(stderr, "warning: failed to restore caller CPU affinity\n");
+            }
+#endif
+            owner.active_operation_affinity = nullptr;
+        }
+    };
+    operation_affinity_guard * active_operation_affinity = nullptr;
 
     explicit impl(const d2f_engine_params & p) {
         if (p.model_path.empty()) {
@@ -1262,6 +1977,49 @@ struct d2f_engine::impl {
         }
         if (p.context_size <= 0 || p.threads < 0 || p.max_iterations <= 0) {
             throw std::invalid_argument("context size, threads, and max iterations must be valid");
+        }
+        if (p.cpu_poll > 100) {
+            throw std::invalid_argument("CPU threadpool polling level must be in [0, 100]");
+        }
+        const int32_t resolved_cpu_threads =
+                lladao::detail::resolve_cpu_threads(p.cpu_mask, p.threads);
+        if (p.cpu_mask != 0 &&
+            (resolved_cpu_threads <= 0 || resolved_cpu_threads > GGML_MAX_N_THREADS)) {
+            throw std::invalid_argument("CPU affinity needs a valid language worker count");
+        }
+        if (!lladao::detail::prefix_prefill_mode_valid(p.prefix_prefill_mode)) {
+            throw std::invalid_argument("invalid prefix prefill mode");
+        }
+        if (p.prefix_pack_size <= 0 || p.prefix_pack_size > p.context_size) {
+            throw std::invalid_argument("prefix pack size must be in [1, context size]");
+        }
+        if (p.prefix_prefill_mode != lladao::d2f_prefix_prefill_mode::exact && !p.prefix_cache) {
+            throw std::invalid_argument("split prefix prefill modes require the prefix cache");
+        }
+        if (p.vision_kv_compression &&
+            p.prefix_prefill_mode != lladao::d2f_prefix_prefill_mode::component_parallel) {
+            throw std::invalid_argument("visual KV compression requires component_parallel prefill");
+        }
+        if (p.vision_kv_tile_size <= 0 || p.vision_kv_topk_tiles < 0 ||
+            !(p.vision_kv_keep_ratio > 0.0f && p.vision_kv_keep_ratio <= 1.0f) ||
+            p.vision_kv_query_window < 0 || p.vision_kv_score_layers <= 0 ||
+            p.vision_kv_pool_kernel <= 0 || p.vision_kv_pool_kernel % 2 == 0) {
+            throw std::invalid_argument("invalid visual KV compression parameters");
+        }
+        if (p.exact_image_max_edge < 0 || p.exact_image_max_edge > 980 ||
+            (p.exact_image_max_edge > 0 &&
+             (p.exact_image_max_edge < 14 || p.exact_image_max_edge % 14 != 0))) {
+            throw std::invalid_argument("exact image max edge must be 0 or a multiple of 14 in [14, 980]");
+        }
+        if (!is_supported_cache_type(p.cache_type_k) || !is_supported_cache_type(p.cache_type_v)) {
+            throw std::invalid_argument("D2F cache types must be f16 or q8_0");
+        }
+        if (!is_valid_flash_attention_mode(p.flash_attention_mode)) {
+            throw std::invalid_argument("invalid Flash Attention mode");
+        }
+        if (p.cache_type_v == GGML_TYPE_Q8_0 &&
+            p.flash_attention_mode != lladao::d2f_flash_attention_mode::enabled) {
+            throw std::invalid_argument("q8_0 V cache requires Flash Attention enabled");
         }
         if (p.yarn_factor < 1.0f || p.yarn_original_context <= 0) {
             throw std::invalid_argument("YaRN factor and original context must be valid");
@@ -1274,19 +2032,43 @@ struct d2f_engine::impl {
         base.mmproj = p.mmproj_path;
         base.n_ctx = p.context_size;
         base.n_gpu_layers = p.gpu_layers;
-        base.n_threads = p.threads;
+        cpu_threads_requested = p.threads;
+        base.n_threads = resolved_cpu_threads;
+        base.cpu_mask = p.cpu_mask;
+        base.cpu_poll = p.cpu_poll;
+        base.cpu_strict = p.cpu_strict;
         base.max_iterations = p.max_iterations;
         base.mask_token_id = p.mask_token_id;
+        base.exact_image_max_edge = p.exact_image_max_edge;
+        base.prefix_prefill_mode = p.prefix_prefill_mode;
+        base.prefix_pack_size = p.prefix_pack_size;
+        base.vision_kv_tile_size = p.vision_kv_tile_size;
+        base.vision_kv_topk_tiles = p.vision_kv_topk_tiles;
+        base.vision_kv_query_window = p.vision_kv_query_window;
+        base.vision_kv_score_layers = p.vision_kv_score_layers;
+        base.vision_kv_pool_kernel = p.vision_kv_pool_kernel;
+        base.vision_kv_keep_ratio = p.vision_kv_keep_ratio;
+        base.cache_type_k = p.cache_type_k;
+        base.cache_type_v = p.cache_type_v;
+        base.flash_attention_mode = p.flash_attention_mode;
         base.yarn_orig_ctx = p.yarn_original_context;
         base.yarn_factor = p.yarn_factor;
         base.vision_gpu = p.vision_gpu;
         base.prefix_cache = p.prefix_cache;
+        base.generation_block_cache = p.generation_block_cache;
+        base.sparse_generation_logits = p.sparse_generation_logits;
+        base.release_vision_after_encode = p.release_vision_after_encode;
+        base.vision_kv_compression = p.vision_kv_compression;
         base.print_timings = p.print_timings;
 
         ggml_backend_load_all();
 
         llama_model_params model_params = llama_model_default_params();
         model_params.n_gpu_layers = base.n_gpu_layers;
+        if (base.n_gpu_layers == 0) {
+            language_devices.push_back(nullptr);
+            model_params.devices = language_devices.data();
+        }
         model.reset(llama_model_load_from_file(base.model.c_str(), model_params));
         if (!model) {
             throw std::runtime_error("failed to load language model: " + base.model);
@@ -1316,8 +2098,61 @@ struct d2f_engine::impl {
 
         token_embeddings = std::make_unique<token_embedding_reader>(base.model, n_embd, n_vocab);
 
+        if (base.vision_kv_compression) {
+            const int32_t n_layer = llama_model_n_layer(model.get());
+            const int32_t n_head = llama_model_n_head(model.get());
+            const int32_t n_head_kv = llama_model_n_head_kv(model.get());
+            if (n_layer <= 0 || n_head <= 0 || n_head_kv <= 0 || n_embd % n_head != 0 ||
+                base.vision_kv_score_layers > n_layer) {
+                throw std::runtime_error("language model does not satisfy the visual KV capture contract");
+            }
+            qk_capture = std::make_unique<lladao::detail::d2f_post_rope_qk_capture>(
+                    lladao::detail::d2f_qk_capture_config {
+                        true,
+                        n_layer,
+                        base.vision_kv_score_layers,
+                        n_head,
+                        n_head_kv,
+                        n_embd / n_head,
+                    });
+        }
+
         if (!p.adapter_path.empty()) {
             set_adapter_locked(p.adapter_path, p.adapter_scale);
+        }
+        std::fprintf(
+                stderr,
+                "D2F cache_type_k=%s cache_type_v=%s flash_attn_requested=%s"
+                " prefix_prefill_mode=%s prefix_pack_size=%" PRId32
+                " generation_block_cache=%s sparse_generation_logits=%s"
+                " release_vision_after_encode=%s cpu_mask_requested=%s"
+                " cpu_threads_requested=%" PRId32 " cpu_threads_configured=%" PRId32
+                " cpu_strict_requested=%s cpu_poll_requested=%" PRIu32
+                " language_device_mode=%s vision_threadpool_shared=false\n",
+                ggml_type_name(base.cache_type_k),
+                ggml_type_name(base.cache_type_v),
+                flash_attention_mode_name(base.flash_attention_mode),
+                lladao::detail::prefix_prefill_mode_name(base.prefix_prefill_mode),
+                base.prefix_pack_size,
+                base.generation_block_cache ? "true" : "false",
+                base.sparse_generation_logits ? "true" : "false",
+                base.release_vision_after_encode ? "true" : "false",
+                lladao::detail::format_cpu_mask(base.cpu_mask).c_str(),
+                cpu_threads_requested,
+                base.n_threads,
+                base.cpu_strict ? "true" : "false",
+                base.cpu_poll,
+                lladao::detail::language_device_mode(base.n_gpu_layers));
+    }
+
+    ~impl() {
+        if (context && cpu_threadpool) {
+            llama_detach_threadpool(context.get());
+        }
+        context.reset();
+        if (cpu_threadpool && cpu_threadpool_free_fn) {
+            cpu_threadpool_free_fn(cpu_threadpool);
+            cpu_threadpool = nullptr;
         }
     }
 
@@ -1375,12 +2210,94 @@ struct d2f_engine::impl {
         adapter_scale = 1.0f;
     }
 
-    void ensure_context(int32_t required_batch, int32_t required_outputs) {
-        if (context && required_batch <= batch_capacity && required_outputs <= output_capacity) {
+    void ensure_cpu_threadpool() {
+        if (base.cpu_mask == 0 || cpu_threadpool) {
+            return;
+        }
+
+        ggml_backend_dev_t cpu_device =
+                ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        if (!cpu_device) {
+            throw std::runtime_error("CPU affinity requested but no CPU backend is available");
+        }
+        ggml_backend_reg_t cpu_registry =
+                ggml_backend_dev_backend_reg(cpu_device);
+        if (!cpu_registry) {
+            throw std::runtime_error("CPU affinity requested but the CPU backend has no registry");
+        }
+
+        auto * new_fn = reinterpret_cast<decltype(ggml_threadpool_new) *>(
+                ggml_backend_reg_get_proc_address(cpu_registry, "ggml_threadpool_new"));
+        auto * free_fn = reinterpret_cast<decltype(ggml_threadpool_free) *>(
+                ggml_backend_reg_get_proc_address(cpu_registry, "ggml_threadpool_free"));
+        auto * pause_fn = reinterpret_cast<decltype(ggml_threadpool_pause) *>(
+                ggml_backend_reg_get_proc_address(cpu_registry, "ggml_threadpool_pause"));
+        if (!new_fn || !free_fn || !pause_fn) {
+            throw std::runtime_error("CPU backend does not provide the ggml threadpool API");
+        }
+
+        ggml_threadpool_params threadpool_params =
+                ggml_threadpool_params_default(base.n_threads);
+        for (int32_t cpu = 0; cpu < 64; ++cpu) {
+            threadpool_params.cpumask[cpu] =
+                    (base.cpu_mask & (uint64_t(1) << cpu)) != 0;
+        }
+        threadpool_params.strict_cpu = base.cpu_strict;
+        threadpool_params.poll = base.cpu_poll;
+        threadpool_params.paused = true;
+
+        ggml_threadpool_t threadpool = new_fn(&threadpool_params);
+        if (!threadpool) {
+            throw std::runtime_error(
+                    "failed to create CPU threadpool with " +
+                    std::to_string(base.n_threads) + " language workers");
+        }
+
+        cpu_threadpool_free_fn = free_fn;
+        cpu_threadpool_pause_fn = pause_fn;
+        cpu_threadpool = threadpool;
+    }
+
+    void pause_cpu_threadpool() noexcept {
+        if (cpu_threadpool && cpu_threadpool_pause_fn) {
+            cpu_threadpool_pause_fn(cpu_threadpool);
+        }
+    }
+
+    void activate_language_affinity() {
+        if (base.cpu_mask == 0) {
+            return;
+        }
+        if (!active_operation_affinity) {
+            throw std::logic_error("language affinity activated outside a D2F request");
+        }
+        active_operation_affinity->capture_before_language_decode();
+    }
+
+    int32_t resolved_cpu_threads() const {
+        if (context) {
+            return llama_n_threads(context.get());
+        }
+        return base.n_threads;
+    }
+
+    void ensure_context(
+            int32_t required_resident,
+            int32_t required_outputs,
+            int32_t required_ubatch) {
+        if (required_resident <= 0 || required_outputs <= 0 || required_ubatch <= 0 ||
+            required_ubatch > required_resident) {
+            throw std::invalid_argument("invalid D2F context capacity request");
+        }
+        if (context && required_resident <= resident_capacity &&
+            required_ubatch <= batch_capacity && required_outputs <= output_capacity) {
             return;
         }
 
         owned_batch.reset();
+        if (context && cpu_threadpool) {
+            llama_detach_threadpool(context.get());
+        }
         context.reset();
 
         llama_context_params context_params = llama_context_default_params();
@@ -1389,11 +2306,25 @@ struct d2f_engine::impl {
         // current request contains only a few thousand resident tokens. The cache
         // stores one entry per submitted token, so size it to this request instead;
         // sparse multimodal RoPE positions do not require empty cache entries.
-        context_params.n_ctx = required_batch;
-        context_params.n_batch = required_batch;
-        context_params.n_ubatch = required_batch;
+        context_params.n_ctx = required_resident;
+        context_params.n_batch = required_ubatch;
+        context_params.n_ubatch = required_ubatch;
         context_params.n_outputs_max = required_outputs;
         context_params.no_perf = false;
+        context_params.type_k = base.cache_type_k;
+        context_params.type_v = base.cache_type_v;
+        context_params.flash_attn_type = to_llama_flash_attention_mode(base.flash_attention_mode);
+        const bool language_gpu = base.n_gpu_layers != 0;
+        context_params.offload_kqv = language_gpu;
+        context_params.op_offload = language_gpu;
+        context_params.abort_callback = [](void * data) {
+            return static_cast<std::atomic<bool> *>(data)->load(std::memory_order_relaxed);
+        };
+        context_params.abort_callback_data = &cancel_requested;
+        if (qk_capture) {
+            context_params.cb_eval = lladao::detail::d2f_post_rope_qk_capture::callback;
+            context_params.cb_eval_user_data = qk_capture.get();
+        }
         if (base.yarn_factor > 1.0f) {
             context_params.rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_YARN;
             context_params.rope_freq_scale = 1.0f / base.yarn_factor;
@@ -1408,19 +2339,72 @@ struct d2f_engine::impl {
         if (!context) {
             throw std::runtime_error("failed to create language context");
         }
+        ensure_cpu_threadpool();
+        if (cpu_threadpool) {
+            llama_attach_threadpool(context.get(), cpu_threadpool, nullptr);
+        }
         std::fprintf(
                 stderr,
                 "D2F context resident_capacity=%" PRIu32 " request_tokens=%" PRId32
-                " configured_limit=%" PRId32 "\n",
+                " ubatch_capacity=%" PRIu32
+                " configured_limit=%" PRId32 " language_gpu=%s cache_type_k=%s"
+                " cache_type_v=%s flash_attn_requested=%s flash_attn_resolved=%s"
+                " cpu_mask_resolved=%s cpu_threads_resolved=%" PRId32
+                " cpu_strict_resolved=%s cpu_poll_resolved=%" PRIu32
+                " cpu_threadpool_attached=%s language_device_mode=%s"
+                " vision_threadpool_shared=false\n",
                 llama_n_ctx(context.get()),
-                required_batch,
-                base.n_ctx);
+                required_resident,
+                llama_n_ubatch(context.get()),
+                base.n_ctx,
+                language_gpu ? "true" : "false",
+                ggml_type_name(base.cache_type_k),
+                ggml_type_name(base.cache_type_v),
+                flash_attention_mode_name(base.flash_attention_mode),
+                llama_flash_attn_type_name(llama_context_flash_attn_type(context.get())),
+                lladao::detail::format_cpu_mask(cpu_threadpool ? base.cpu_mask : 0).c_str(),
+                resolved_cpu_threads(),
+                cpu_threadpool && base.cpu_strict ? "true" : "false",
+                cpu_threadpool ? base.cpu_poll : 0,
+                cpu_threadpool ? "true" : "false",
+                lladao::detail::language_device_mode(base.n_gpu_layers));
         llama_set_causal_attn(context.get(), false);
         apply_adapter();
 
-        owned_batch = std::make_unique<batch_owner>(required_batch, n_embd);
-        batch_capacity = required_batch;
+        owned_batch = std::make_unique<batch_owner>(required_ubatch, n_embd);
+        batch_capacity = required_ubatch;
+        resident_capacity = static_cast<int32_t>(llama_n_ctx(context.get()));
         output_capacity = required_outputs;
+    }
+
+    void set_cache_audit(d2f_result & result) const {
+        result.language_device_mode =
+                lladao::detail::language_device_mode(base.n_gpu_layers);
+        result.cache_type_k = ggml_type_name(base.cache_type_k);
+        result.cache_type_v = ggml_type_name(base.cache_type_v);
+        result.flash_attention_requested = flash_attention_mode_name(base.flash_attention_mode);
+        result.flash_attention_resolved = context
+                ? llama_flash_attn_type_name(llama_context_flash_attn_type(context.get()))
+                : "not_initialized";
+        result.flash_attention_mode = result.flash_attention_resolved;
+        result.prefix_prefill_mode =
+                lladao::detail::prefix_prefill_mode_name(base.prefix_prefill_mode);
+        result.prefix_pack_size = base.prefix_pack_size;
+        result.vision_kv_compression = base.vision_kv_compression;
+        result.generation_block_cache = base.prefix_cache && base.generation_block_cache;
+        result.sparse_generation_logits = base.sparse_generation_logits;
+        result.cpu_mask_requested = lladao::detail::format_cpu_mask(base.cpu_mask);
+        result.cpu_mask_resolved =
+                lladao::detail::format_cpu_mask(cpu_threadpool ? base.cpu_mask : 0);
+        result.cpu_threads_requested = cpu_threads_requested;
+        result.cpu_threads_resolved = resolved_cpu_threads();
+        result.cpu_poll_requested = base.cpu_poll;
+        result.cpu_poll_resolved = cpu_threadpool ? base.cpu_poll : 0;
+        result.cpu_strict_requested = base.cpu_strict;
+        result.cpu_strict_resolved = cpu_threadpool && base.cpu_strict;
+        result.cpu_threadpool_attached = cpu_threadpool != nullptr;
+        result.vision_threadpool_shared = false;
+        result.release_vision_after_encode = base.release_vision_after_encode;
     }
 
     pd_artifact_metadata current_pd_metadata(const cached_prefix_layout & layout) const {
@@ -1438,6 +2422,11 @@ struct d2f_engine::impl {
         metadata.has_adapter = adapter != nullptr;
         metadata.adapter_scale = adapter_scale;
         metadata.adapter_size = adapter ? file_size(adapter_path) : 0;
+        metadata.cache_type_k = base.cache_type_k;
+        metadata.cache_type_v = base.cache_type_v;
+        metadata.prefix_prefill_mode = base.prefix_prefill_mode;
+        metadata.prefix_pack_size = base.prefix_pack_size;
+        metadata.flash_attention_mode = base.flash_attention_mode;
         return metadata;
     }
 
@@ -1451,6 +2440,16 @@ struct d2f_engine::impl {
         if (metadata.yarn_orig_ctx != base.yarn_orig_ctx ||
             metadata.yarn_factor != base.yarn_factor) {
             throw std::runtime_error("PD state does not match the configured RoPE scaling");
+        }
+        if (metadata.cache_type_k != base.cache_type_k || metadata.cache_type_v != base.cache_type_v) {
+            throw std::runtime_error("PD state does not match the configured KV cache types");
+        }
+        if (metadata.prefix_prefill_mode != base.prefix_prefill_mode ||
+            metadata.prefix_pack_size != base.prefix_pack_size) {
+            throw std::runtime_error("PD state does not match the configured prefix prefill mode");
+        }
+        if (metadata.flash_attention_mode != base.flash_attention_mode) {
+            throw std::runtime_error("PD state does not match the configured Flash Attention mode");
         }
         if (metadata.has_adapter != (adapter != nullptr) ||
             metadata.adapter_scale != adapter_scale ||
@@ -1494,7 +2493,10 @@ struct d2f_engine::impl {
 
         const int32_t required_tokens =
                 expected.layout.total_length + D2F_GENERATION_LENGTH;
-        ensure_context(required_tokens, D2F_GENERATION_LENGTH);
+        ensure_context(
+                required_tokens,
+                D2F_GENERATION_LENGTH,
+                D2F_GENERATION_LENGTH);
         llama_memory_clear(llama_get_memory(context.get()), true);
 
         std::vector<llama_token> metadata(D2F_PD_METADATA_TOKENS);
@@ -1527,6 +2529,7 @@ struct d2f_engine::impl {
             throw std::logic_error("full-sequence D2F decoding requires prefix embeddings");
         }
 
+        activate_language_affinity();
         llama_set_d2f_attention(
                 context.get(),
                 layout.image_length,
@@ -1543,6 +2546,11 @@ struct d2f_engine::impl {
         scheduler_params.initial_token_id = bos;
         scheduler_params.eos_token_id = eos;
         diffusion_d2f_scheduler scheduler(scheduler_params);
+        const bool generation_block_cache = prefix_cache && base.generation_block_cache;
+        lladao::detail::d2f_decode_counters decode_counters;
+        int32_t cached_complete_end = 0;
+        result.generation_block_cache = generation_block_cache;
+        result.sparse_generation_logits = base.sparse_generation_logits;
 
         const auto decode_started = std::chrono::steady_clock::now();
         while (!scheduler.done()) {
@@ -1555,13 +2563,23 @@ struct d2f_engine::impl {
                 break;
             }
             const auto iteration_started = std::chrono::steady_clock::now();
+            const lladao::detail::d2f_generation_decode_plan plan =
+                    lladao::detail::plan_d2f_generation_decode(
+                            scheduler.tokens(),
+                            mask,
+                            step.active_start,
+                            step.active_end,
+                            D2F_BLOCK_LENGTH,
+                            cached_complete_end,
+                            generation_block_cache,
+                            base.sparse_generation_logits);
 
             llama_batch & batch = owned_batch->get();
             if (prefix_cache) {
                 if (!llama_memory_seq_rm(
                             llama_get_memory(context.get()),
                             0,
-                            layout.generation_position,
+                            layout.generation_position + plan.first_position,
                             -1)) {
                     throw std::runtime_error("failed to discard the dynamic D2F cache range");
                 }
@@ -1569,7 +2587,7 @@ struct d2f_engine::impl {
                         batch,
                         layout.generation_position,
                         scheduler.tokens(),
-                        step.active_end,
+                        plan,
                         *token_embeddings,
                         n_embd);
             } else {
@@ -1578,43 +2596,62 @@ struct d2f_engine::impl {
                         batch,
                         *input_prefix,
                         scheduler.tokens(),
-                        step.active_end,
+                        plan,
                         *token_embeddings,
                         n_embd);
             }
             const int32_t decode_result = llama_decode(context.get(), batch);
             if (decode_result != 0) {
+                if (decode_result == 2 && cancel_requested.load(std::memory_order_relaxed)) {
+                    result.cancelled = true;
+                    break;
+                }
                 throw std::runtime_error("llama_decode failed with code " + std::to_string(decode_result));
             }
+            // AUTO flash attention is resolved by the backend for the live
+            // context. Refresh after every successful decode so structured
+            // results never report the requested mode as if it were resolved.
+            set_cache_audit(result);
 
-            const float * logits = llama_get_logits(context.get());
-            if (!logits) {
-                throw std::runtime_error("language model returned no generation logits");
-            }
             const std::vector<diffusion_d2f_candidate> candidates =
-                    diffusion_d2f_argmax_candidates(
-                            logits,
-                            step.active_end,
-                            n_vocab,
-                            prefix_cache ? 0 : layout.total_length,
+                    collect_generation_candidates(
+                            context.get(),
+                            plan,
+                            scheduler.tokens(),
+                            mask,
                             prefix_cache ? 0 : layout.total_length,
                             D2F_GENERATION_LENGTH,
-                            false);
+                            n_vocab);
             const std::vector<diffusion_d2f_update> updates = scheduler.apply_candidates(candidates);
+            cached_complete_end = plan.next_cached_complete_end;
+            decode_counters.add(plan, prefix_cache ? 0 : layout.total_length);
             const auto iteration_finished = std::chrono::steady_clock::now();
             ++result.iterations;
             std::fprintf(stderr,
                     "D2F iteration %" PRId32 ": active [%" PRId32 ", %" PRId32
-                    "), blocks %" PRId32 ", updates %zu, decode_tokens=%" PRId32
+                    "), decode [%" PRId32 ", %" PRId32 "), cached_complete=%" PRId32
+                    ", blocks %" PRId32 ", updates %zu, decode_tokens=%" PRId32
+                    ", rebuild_rows=%" PRId32 ", logit_rows=%zu"
                     ", seconds=%.6f\n",
                     step.iteration,
                     step.active_start,
                     step.active_end,
+                    plan.first_position,
+                    plan.active_end,
+                    cached_complete_end,
                     step.blocks_added,
                     updates.size(),
                     batch.n_tokens,
+                    plan.rebuild_rows(),
+                    plan.logit_positions.size(),
                     std::chrono::duration<double>(iteration_finished - iteration_started).count());
         }
+
+        result.d2f_input_rows = decode_counters.input_rows;
+        result.d2f_active_rows = decode_counters.active_rows;
+        result.d2f_rebuild_rows = decode_counters.rebuild_rows;
+        result.d2f_logit_rows = decode_counters.logit_rows;
+        result.d2f_reused_input_rows = decode_counters.reused_input_rows;
 
         const auto generation_finished = std::chrono::steady_clock::now();
         result.decode_seconds =
@@ -1623,9 +2660,20 @@ struct d2f_engine::impl {
                 std::chrono::duration<double>(generation_finished - generation_started).count();
         std::fprintf(
                 stderr,
-                "D2F decode_seconds=%.6f generation_seconds=%.6f\n",
+                "D2F decode_seconds=%.6f generation_seconds=%.6f"
+                " input_rows=%" PRIu64 " active_rows=%" PRIu64
+                " rebuild_rows=%" PRIu64 " logit_rows=%" PRIu64
+                " reused_input_rows=%" PRIu64 " generation_block_cache=%s"
+                " sparse_generation_logits=%s\n",
                 result.decode_seconds,
-                result.generation_seconds);
+                result.generation_seconds,
+                result.d2f_input_rows,
+                result.d2f_active_rows,
+                result.d2f_rebuild_rows,
+                result.d2f_logit_rows,
+                result.d2f_reused_input_rows,
+                result.generation_block_cache ? "true" : "false",
+                result.sparse_generation_logits ? "true" : "false");
         if (base.print_timings) {
             llama_perf_context_print(context.get());
         }
@@ -1656,6 +2704,7 @@ struct d2f_engine::impl {
         p.tile_retrieval_mask_rounds = request.tile_retrieval_mask_rounds;
         p.full_page_tiles = request.full_page_tiles || request.tile_retrieval_topk > 0;
         p.full_page_overview = request.full_page_overview;
+        p.exact_image = request.exact_image;
         p.preprocess_only = request.preprocess_only;
 
         if (!pd_state_out.empty() && (!p.prefix_cache || p.preprocess_only)) {
@@ -1673,6 +2722,9 @@ struct d2f_engine::impl {
         if (p.tile_retrieval_topk < 0 || p.tile_retrieval_mask_rounds <= 0) {
             throw std::invalid_argument("retrieval Top-K and mask rounds must be valid");
         }
+        if (p.exact_image && p.full_page_tiles) {
+            throw std::invalid_argument("exact image and full-page tiles are mutually exclusive");
+        }
 
         const std::string operation = trim_text(p.prompt);
         const std::string retrieval_query =
@@ -1682,6 +2734,7 @@ struct d2f_engine::impl {
         }
 
         d2f_result result;
+        set_cache_audit(result);
         std::vector<encoded_image> native_images;
         full_page_images page;
         std::vector<const encoded_image *> selected_images;
@@ -1736,15 +2789,30 @@ struct d2f_engine::impl {
         } else {
             prompt_tokens = add_text_boundaries(vocab, operation);
             if (!request.image_cache_key.empty() && cached_native_image &&
-                cached_native_image_key == request.image_cache_key) {
+                cached_native_image_key == request.image_cache_key &&
+                cached_native_image_exact == p.exact_image) {
                 result.vision_cache_hit = true;
                 selected_images.push_back(cached_native_image.get());
             } else {
-                if (!native_vision) {
-                    native_vision = make_vision_context(base, model.get(), false);
+                if (lladao::detail::vision_context_needs_rebuild(
+                            native_vision != nullptr,
+                            native_vision_exact,
+                            p.exact_image)) {
+                    native_vision.reset();
+                    native_vision = make_vision_context(
+                            base,
+                            model.get(),
+                            p.exact_image,
+                            p.exact_image ? base.exact_image_max_edge : 0);
+                    native_vision_exact = p.exact_image;
                 }
                 const auto vision_started = std::chrono::steady_clock::now();
-                encoded_image image = encode_image(native_vision.get(), p.image, n_embd);
+                encoded_image image = encode_image(
+                        native_vision.get(),
+                        p.image,
+                        n_embd,
+                        p.exact_image,
+                        base.exact_image_max_edge);
                 result.vision_encode_seconds = std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - vision_started).count();
                 image.dense_position = 0;
@@ -1754,8 +2822,19 @@ struct d2f_engine::impl {
                 } else {
                     cached_native_image = std::make_unique<encoded_image>(std::move(image));
                     cached_native_image_key = request.image_cache_key;
+                    cached_native_image_exact = p.exact_image;
                     selected_images.push_back(cached_native_image.get());
                 }
+            }
+            const bool released_now = lladao::detail::release_vision_context(
+                    native_vision,
+                    base.release_vision_after_encode);
+            result.vision_context_released =
+                    base.release_vision_after_encode && native_vision == nullptr;
+            if (released_now) {
+                std::fprintf(
+                        stderr,
+                        "D2F released native vision context after image embedding encode\n");
             }
             dense_image_length = selected_images.back()->n_tokens + 2;
             max_work_tokens =
@@ -1814,6 +2893,14 @@ struct d2f_engine::impl {
                     p.n_ctx);
             result.image_tokens = input_prefix.image_length;
             result.input_tokens = input_prefix.total_length;
+            const int32_t prompt_length =
+                    input_prefix.total_length - input_prefix.image_length;
+            result.prefix_chunk_count = static_cast<int32_t>(
+                    lladao::detail::plan_prefix_chunks(
+                            input_prefix.image_lengths,
+                            prompt_length,
+                            base.prefix_prefill_mode,
+                            base.prefix_pack_size).size());
             result.preprocessed_only = true;
             return result;
         }
@@ -1823,10 +2910,12 @@ struct d2f_engine::impl {
                 retrieval_query_tokens.empty()
                         ? 0
                         : static_cast<int32_t>(retrieval_query_tokens.size()));
-        ensure_context(max_work_tokens, required_outputs);
 
         if (p.tile_retrieval_topk > 0) {
+            ensure_context(max_work_tokens, required_outputs, max_work_tokens);
+            set_cache_audit(result);
             llama_set_d2f_attention(context.get(), -1, -1, -1, -1, 0);
+            activate_language_affinity();
             const retrieval_result retrieval = retrieve_image_tiles(
                     context.get(),
                     *owned_batch,
@@ -1840,7 +2929,14 @@ struct d2f_engine::impl {
                     p.tile_retrieval_topk,
                     p.tile_retrieval_mask_rounds,
                     n_embd,
-                    n_vocab);
+                    n_vocab,
+                    cancel_requested);
+            set_cache_audit(result);
+
+            if (retrieval.cancelled) {
+                result.cancelled = true;
+                return result;
+            }
 
             for (int32_t source_index : retrieval.selected_source_indices) {
                 const auto found = std::find_if(
@@ -1891,6 +2987,28 @@ struct d2f_engine::impl {
         if (max_tokens > p.n_ctx || max_tokens > max_work_tokens) {
             throw std::logic_error("selected prefix exceeds its validated capacity");
         }
+        const int32_t prompt_length = input_prefix.total_length - input_prefix.image_length;
+        const lladao::detail::d2f_visual_prefix_layout visual_prefix_layout =
+                build_visual_prefix_layout(selected_images, input_prefix, prompt_position);
+        const std::vector<lladao::detail::prefix_chunk> prefix_chunks =
+                lladao::detail::plan_prefix_chunks(
+                        input_prefix.image_lengths,
+                        prompt_length,
+                        base.prefix_prefill_mode,
+                        base.prefix_pack_size);
+        const int32_t required_ubatch = p.prefix_cache
+                ? lladao::detail::prefix_chunk_ubatch(prefix_chunks, D2F_GENERATION_LENGTH)
+                : max_tokens;
+        result.prefix_chunk_count = static_cast<int32_t>(prefix_chunks.size());
+        result.image_span_count = static_cast<int32_t>(selected_images.size());
+        result.image_prefill_calls = static_cast<int32_t>(std::count_if(
+                prefix_chunks.begin(),
+                prefix_chunks.end(),
+                [](const lladao::detail::prefix_chunk & chunk) {
+                    return chunk.kind == lladao::detail::prefix_chunk_kind::image;
+                }));
+        ensure_context(max_work_tokens, required_outputs, required_ubatch);
+        set_cache_audit(result);
         int32_t selected_patches = 0;
         for (const encoded_image * image : selected_images) {
             selected_patches += image->n_tokens;
@@ -1931,7 +3049,11 @@ struct d2f_engine::impl {
 
         result.image_tokens = input_prefix.image_length;
         result.input_tokens = input_prefix.total_length;
-        const cached_prefix_layout layout = {
+        result.dense_prefix_tokens = input_prefix.total_length;
+        result.cached_prefix_tokens = input_prefix.total_length;
+        result.vision_patches = selected_patches;
+        result.vision_kept_patches = selected_patches;
+        cached_prefix_layout layout = {
             input_prefix.image_length,
             input_prefix.total_length,
             prompt_position,
@@ -1945,25 +3067,161 @@ struct d2f_engine::impl {
                 layout.generation_position,
                 D2F_BLOCK_LENGTH);
 
+        activate_language_affinity();
         llama_perf_context_reset(context.get());
         const auto generation_started = std::chrono::steady_clock::now();
         llama_memory_clear(llama_get_memory(context.get()), true);
         if (p.prefix_cache) {
+            if (qk_capture) {
+                qk_capture->reset();
+            }
             const auto prefill_started = std::chrono::steady_clock::now();
             llama_batch & batch = owned_batch->get();
-            fill_prefix_batch(batch, input_prefix);
-            const int32_t decode_result = llama_decode(context.get(), batch);
-            if (decode_result != 0) {
-                throw std::runtime_error("prefix prefill llama_decode failed with code " + std::to_string(decode_result));
+            for (size_t chunk_index = 0; chunk_index < prefix_chunks.size(); ++chunk_index) {
+                const lladao::detail::prefix_chunk & chunk = prefix_chunks[chunk_index];
+                const auto chunk_started = std::chrono::steady_clock::now();
+                if (qk_capture) {
+                    const lladao::detail::d2f_qk_capture_phase phase =
+                            chunk.kind == lladao::detail::prefix_chunk_kind::image
+                                    ? lladao::detail::d2f_qk_capture_phase::image
+                                    : chunk.kind == lladao::detail::prefix_chunk_kind::prompt
+                                            ? lladao::detail::d2f_qk_capture_phase::prompt
+                                            : lladao::detail::d2f_qk_capture_phase::inactive;
+                    if (phase == lladao::detail::d2f_qk_capture_phase::inactive) {
+                        throw std::logic_error("visual KV compression needs image then prompt prefill calls");
+                    }
+                    qk_capture->begin_phase(phase, chunk.length);
+                }
+                fill_prefix_batch_range(
+                        batch,
+                        input_prefix,
+                        chunk.offset,
+                        chunk.length,
+                        n_embd);
+                const int32_t decode_result = llama_decode(context.get(), batch);
+                if (decode_result != 0) {
+                    if (qk_capture) {
+                        qk_capture->reset();
+                    }
+                    if (decode_result == 2 && cancel_requested.load(std::memory_order_relaxed)) {
+                        const auto prefill_finished = std::chrono::steady_clock::now();
+                        result.prefill_seconds = std::chrono::duration<double>(
+                                prefill_finished - prefill_started).count();
+                        result.generation_seconds = std::chrono::duration<double>(
+                                prefill_finished - generation_started).count();
+                        result.cancelled = true;
+                        set_cache_audit(result);
+                        return result;
+                    }
+                    throw std::runtime_error(
+                            "prefix prefill chunk " + std::to_string(chunk_index + 1) +
+                            " llama_decode failed with code " + std::to_string(decode_result));
+                }
+                if (qk_capture) {
+                    qk_capture->finish_phase();
+                }
+                set_cache_audit(result);
+                llama_synchronize(context.get());
+                const double chunk_seconds = std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - chunk_started).count();
+                std::fprintf(
+                        stderr,
+                        "D2F prefix_prefill mode=%s pack_size=%" PRId32
+                        " chunk=%zu/%zu kind=%s component=%" PRId32
+                        " tokens=[%" PRId32 ",%" PRId32 ") seconds=%.6f\n",
+                        lladao::detail::prefix_prefill_mode_name(base.prefix_prefill_mode),
+                        base.prefix_pack_size,
+                        chunk_index + 1,
+                        prefix_chunks.size(),
+                        lladao::detail::prefix_chunk_kind_name(chunk.kind),
+                        chunk.component,
+                        chunk.offset,
+                        chunk.offset + chunk.length,
+                        chunk_seconds);
             }
-            llama_synchronize(context.get());
             const auto prefill_finished = std::chrono::steady_clock::now();
             result.prefill_seconds =
                     std::chrono::duration<double>(prefill_finished - prefill_started).count();
+
+            if (qk_capture) {
+                const auto compression_started = std::chrono::steady_clock::now();
+                const lladao::detail::d2f_visual_kv_compression_config config = {
+                    base.vision_kv_tile_size,
+                    base.vision_kv_topk_tiles,
+                    base.vision_kv_keep_ratio,
+                    base.vision_kv_query_window,
+                    base.vision_kv_score_layers,
+                    lladao::detail::d2f_kv_score_layer_mode::last,
+                    base.vision_kv_pool_kernel,
+                };
+                const lladao::detail::d2f_visual_kv_keep_plan keep_plan =
+                        build_visual_kv_keep_plan_from_capture(
+                                *qk_capture,
+                                model.get(),
+                                visual_prefix_layout,
+                                config);
+                std::vector<uint32_t> sources(keep_plan.source_indices.size());
+                std::transform(
+                        keep_plan.source_indices.begin(),
+                        keep_plan.source_indices.end(),
+                        sources.begin(),
+                        [](int32_t source) { return static_cast<uint32_t>(source); });
+                std::vector<llama_pos> positions(
+                        keep_plan.destination_positions.begin(),
+                        keep_plan.destination_positions.end());
+                if (!llama_kv_cache_compact_heads(
+                            context.get(),
+                            0,
+                            static_cast<uint32_t>(input_prefix.total_length),
+                            static_cast<uint32_t>(keep_plan.keep_count),
+                            sources.data(),
+                            sources.size(),
+                            positions.data())) {
+                    throw std::runtime_error("per-layer/per-head visual KV compaction failed");
+                }
+                qk_capture->reset();
+                result.kv_cache_compression_seconds = std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - compression_started).count();
+                result.cached_prefix_tokens = keep_plan.stats.cached_prefix_tokens;
+                result.vision_kept_patches = keep_plan.stats.vision_kept_patches;
+                result.vision_tiles = keep_plan.stats.vision_tiles;
+                result.vision_selected_tiles = keep_plan.stats.vision_selected_tiles;
+                result.vision_kv_compression_ratio = keep_plan.stats.compression_ratio;
+                layout.image_length = keep_plan.keep_count - prompt_length;
+                layout.total_length = keep_plan.keep_count;
+                llama_set_d2f_attention(
+                        context.get(),
+                        layout.image_length,
+                        layout.total_length,
+                        layout.prompt_position,
+                        layout.generation_position,
+                        D2F_BLOCK_LENGTH);
+                std::fprintf(
+                        stderr,
+                        "D2F visual_kv_compression dense_prefix=%" PRId32
+                        " cached_prefix=%" PRId32 " ratio=%.6f patches=%" PRId32
+                        " kept_patches=%" PRId32 " tiles=%" PRId32
+                        " selected_tiles=%" PRId32 " seconds=%.6f\n",
+                        keep_plan.stats.dense_prefix_tokens,
+                        keep_plan.stats.cached_prefix_tokens,
+                        keep_plan.stats.compression_ratio,
+                        keep_plan.stats.vision_patches,
+                        keep_plan.stats.vision_kept_patches,
+                        keep_plan.stats.vision_tiles,
+                        keep_plan.stats.vision_selected_tiles,
+                        result.kv_cache_compression_seconds);
+            }
             std::fprintf(
                     stderr,
-                    "D2F prefix_cache=enabled cached_tokens=%" PRId32 " prefill_seconds=%.6f\n",
-                    input_prefix.total_length,
+                    "D2F prefix_cache=enabled mode=%s pack_size=%" PRId32
+                    " chunks=%zu image_spans=%" PRId32 " image_prefill_calls=%" PRId32
+                    " cached_tokens=%" PRId32 " prefill_seconds=%.6f\n",
+                    lladao::detail::prefix_prefill_mode_name(base.prefix_prefill_mode),
+                    base.prefix_pack_size,
+                    prefix_chunks.size(),
+                    result.image_span_count,
+                    result.image_prefill_calls,
+                    result.cached_prefix_tokens,
                     result.prefill_seconds);
 
             if (!pd_state_out.empty()) {
@@ -2011,6 +3269,7 @@ struct d2f_engine::impl {
         llama_perf_context_reset(context.get());
 
         d2f_result result;
+        set_cache_audit(result);
         result.image_tokens = metadata.layout.image_length;
         result.input_tokens = metadata.layout.total_length;
         result.state_bytes = state_bytes;
@@ -2047,6 +3306,7 @@ d2f_result d2f_engine::generate(const d2f_request & request) {
         throw std::logic_error("LLaDA-o engine is not initialized");
     }
     std::lock_guard<std::mutex> lock(impl_->operation_mutex);
+    impl::operation_affinity_guard affinity_guard(*impl_);
     impl_->cancel_requested.store(false, std::memory_order_relaxed);
     impl_->active.store(true, std::memory_order_release);
     struct active_guard {
@@ -2065,6 +3325,7 @@ d2f_result d2f_engine::prefill_to_file(
         throw std::logic_error("LLaDA-o engine is not initialized");
     }
     std::lock_guard<std::mutex> lock(impl_->operation_mutex);
+    impl::operation_affinity_guard affinity_guard(*impl_);
     impl_->cancel_requested.store(false, std::memory_order_relaxed);
     impl_->active.store(true, std::memory_order_release);
     struct active_guard {
@@ -2081,6 +3342,7 @@ d2f_result d2f_engine::decode_from_file(const std::string & state_path) {
         throw std::logic_error("LLaDA-o engine is not initialized");
     }
     std::lock_guard<std::mutex> lock(impl_->operation_mutex);
+    impl::operation_affinity_guard affinity_guard(*impl_);
     impl_->cancel_requested.store(false, std::memory_order_relaxed);
     impl_->active.store(true, std::memory_order_release);
     struct active_guard {
@@ -2118,6 +3380,182 @@ bool d2f_engine::busy() const noexcept {
     return impl_ && impl_->active.load(std::memory_order_acquire);
 }
 
+static d2f_request make_request(
+        const params & p,
+        const std::string & image,
+        const std::string & prompt,
+        const std::string & retrieval_query,
+        const std::string & image_cache_key) {
+    d2f_request request;
+    request.image_path = image;
+    request.image_cache_key = image_cache_key;
+    request.prompt = prompt;
+    request.retrieval_query = retrieval_query;
+    request.full_page_tile_size = p.full_page_tile_size;
+    request.tile_retrieval_topk = p.tile_retrieval_topk;
+    request.tile_retrieval_mask_rounds = p.tile_retrieval_mask_rounds;
+    request.full_page_tiles = p.full_page_tiles;
+    request.full_page_overview = p.full_page_overview;
+    request.exact_image = p.exact_image;
+    request.preprocess_only = p.preprocess_only;
+    return request;
+}
+
+static json make_batch_output(
+        const batch_input & input,
+        size_t index,
+        const d2f_result & result,
+        double latency_seconds,
+        const std::string & error) {
+    const json error_value = error.empty() ? json(nullptr) : json(error);
+    return {
+        { "id",                    input.id                     },
+        { "index",                 index                        },
+        { "raw_output",            result.text                  },
+        { "language_device_mode",  result.language_device_mode  },
+        { "cache_type_k",          result.cache_type_k          },
+        { "cache_type_v",          result.cache_type_v          },
+        { "flash_attention_mode",  result.flash_attention_mode  },
+        { "flash_attention_requested", result.flash_attention_requested },
+        { "flash_attention_resolved",  result.flash_attention_resolved  },
+        { "prefix_prefill_mode",    result.prefix_prefill_mode    },
+        { "prefix_pack_size",       result.prefix_pack_size       },
+        { "prefix_chunk_count",     result.prefix_chunk_count     },
+        { "image_span_count",       result.image_span_count       },
+        { "image_prefill_calls",    result.image_prefill_calls    },
+        { "dense_prefix_tokens",    result.dense_prefix_tokens    },
+        { "cached_prefix_tokens",   result.cached_prefix_tokens   },
+        { "vision_patches",         result.vision_patches         },
+        { "vision_kept_patches",    result.vision_kept_patches    },
+        { "vision_tiles",           result.vision_tiles           },
+        { "vision_selected_tiles",  result.vision_selected_tiles  },
+        { "vision_kv_compression",  result.vision_kv_compression  },
+        { "vision_kv_compression_ratio", result.vision_kv_compression_ratio },
+        { "cpu_mask_requested",     result.cpu_mask_requested     },
+        { "cpu_mask_resolved",      result.cpu_mask_resolved      },
+        { "cpu_threads_requested",  result.cpu_threads_requested  },
+        { "cpu_threads_resolved",   result.cpu_threads_resolved   },
+        { "cpu_strict_requested",   result.cpu_strict_requested   },
+        { "cpu_strict_resolved",    result.cpu_strict_resolved    },
+        { "cpu_poll_requested",     result.cpu_poll_requested     },
+        { "cpu_poll_resolved",      result.cpu_poll_resolved      },
+        { "cpu_threadpool_attached", result.cpu_threadpool_attached },
+        { "vision_threadpool_shared", result.vision_threadpool_shared },
+        { "latency_seconds",       latency_seconds              },
+        { "error",                 error_value                  },
+        { "iterations",            result.iterations            },
+        { "image_tokens",          result.image_tokens          },
+        { "input_tokens",          result.input_tokens          },
+        { "state_bytes",           result.state_bytes           },
+        { "d2f_input_rows",        result.d2f_input_rows        },
+        { "d2f_active_rows",       result.d2f_active_rows       },
+        { "d2f_rebuild_rows",      result.d2f_rebuild_rows      },
+        { "d2f_logit_rows",        result.d2f_logit_rows        },
+        { "d2f_reused_input_rows", result.d2f_reused_input_rows },
+        { "prefill_seconds",       result.prefill_seconds       },
+        { "state_io_seconds",      result.state_io_seconds      },
+        { "decode_seconds",        result.decode_seconds        },
+        { "vision_encode_seconds", result.vision_encode_seconds },
+        { "kv_cache_compression_seconds", result.kv_cache_compression_seconds },
+        { "generation_seconds",    result.generation_seconds    },
+        { "vision_cache_hit",      result.vision_cache_hit      },
+        { "generation_block_cache", result.generation_block_cache },
+        { "sparse_generation_logits", result.sparse_generation_logits },
+        { "release_vision_after_encode", result.release_vision_after_encode },
+        { "vision_context_released", result.vision_context_released },
+        { "cancelled",             result.cancelled             },
+        { "preprocessed_only",     result.preprocessed_only     },
+        { "prefilled_only",        result.prefilled_only        },
+        { "decoded_from_state",    result.decoded_from_state    },
+    };
+}
+
+static int run_batch(
+        const params & p,
+        const d2f_engine_params & engine_params) {
+    const std::vector<batch_input> inputs = read_batch_inputs(p.input_jsonl);
+    std::ofstream output(p.output_jsonl, std::ios::binary | std::ios::trunc);
+    if (!output) {
+        throw std::runtime_error("failed to open batch output: " + p.output_jsonl);
+    }
+
+    d2f_engine engine(engine_params);
+    bool had_error = false;
+    for (size_t index = 0; index < inputs.size(); ++index) {
+        const batch_input & input = inputs[index];
+        const std::string progress_id = json(input.id).dump(
+                -1, ' ', false, json::error_handler_t::replace);
+        std::fprintf(
+                stderr,
+                "batch request %zu/%zu id=%s started\n",
+                index + 1,
+                inputs.size(),
+                progress_id.c_str());
+        const auto started = std::chrono::steady_clock::now();
+        d2f_result result;
+        result.language_device_mode =
+                lladao::detail::language_device_mode(engine_params.gpu_layers);
+        result.cache_type_k = ggml_type_name(engine_params.cache_type_k);
+        result.cache_type_v = ggml_type_name(engine_params.cache_type_v);
+        result.flash_attention_requested =
+                flash_attention_mode_name(engine_params.flash_attention_mode);
+        result.flash_attention_resolved = "not_initialized";
+        result.flash_attention_mode = result.flash_attention_resolved;
+        result.prefix_prefill_mode =
+                lladao::detail::prefix_prefill_mode_name(engine_params.prefix_prefill_mode);
+        result.prefix_pack_size = engine_params.prefix_pack_size;
+        result.vision_kv_compression = engine_params.vision_kv_compression;
+        result.generation_block_cache =
+                engine_params.prefix_cache && engine_params.generation_block_cache;
+        result.sparse_generation_logits = engine_params.sparse_generation_logits;
+        result.cpu_mask_requested =
+                lladao::detail::format_cpu_mask(engine_params.cpu_mask);
+        result.cpu_mask_resolved = "0x0";
+        result.cpu_threads_requested = engine_params.threads;
+        result.cpu_threads_resolved = lladao::detail::resolve_cpu_threads(
+                engine_params.cpu_mask,
+                engine_params.threads);
+        result.cpu_strict_requested = engine_params.cpu_strict;
+        result.cpu_poll_requested = engine_params.cpu_poll;
+        result.vision_threadpool_shared = false;
+        result.release_vision_after_encode = engine_params.release_vision_after_encode;
+        std::string error;
+        try {
+            const std::string & retrieval_query =
+                    input.retrieval_query.empty() ? p.retrieval_query : input.retrieval_query;
+            result = engine.generate(make_request(
+                    p,
+                    input.image,
+                    input.prompt,
+                    retrieval_query,
+                    input.image_cache_key));
+        } catch (const std::exception & exception) {
+            error = exception.what();
+            had_error = true;
+        } catch (...) {
+            error = "unknown exception";
+            had_error = true;
+        }
+        const double latency_seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - started).count();
+        const json row = make_batch_output(input, index, result, latency_seconds, error);
+        output << row.dump(-1, ' ', false, json::error_handler_t::replace) << '\n';
+        output.flush();
+        if (!output) {
+            throw std::runtime_error("failed while writing batch output: " + p.output_jsonl);
+        }
+        std::fprintf(
+                stderr,
+                "batch request %zu/%zu id=%s status=%s latency_seconds=%.6f\n",
+                index + 1,
+                inputs.size(),
+                progress_id.c_str(),
+                error.empty() ? (result.cancelled ? "cancelled" : "ok") : "error",
+                latency_seconds);
+    }
+    return had_error ? 1 : 0;
+}
+
 int cli_main(int argc, char ** argv) {
     try {
         const params p = parse_args(argc, argv);
@@ -2128,23 +3566,38 @@ int cli_main(int argc, char ** argv) {
         engine_params.context_size = p.n_ctx;
         engine_params.gpu_layers = p.n_gpu_layers;
         engine_params.threads = p.n_threads;
+        engine_params.cpu_mask = p.cpu_mask;
+        engine_params.cpu_strict = p.cpu_strict;
+        engine_params.cpu_poll = p.cpu_poll;
         engine_params.max_iterations = p.max_iterations;
         engine_params.mask_token_id = p.mask_token_id;
+        engine_params.exact_image_max_edge = p.exact_image_max_edge;
+        engine_params.prefix_prefill_mode = p.prefix_prefill_mode;
+        engine_params.prefix_pack_size = p.prefix_pack_size;
+        engine_params.vision_kv_tile_size = p.vision_kv_tile_size;
+        engine_params.vision_kv_topk_tiles = p.vision_kv_topk_tiles;
+        engine_params.vision_kv_query_window = p.vision_kv_query_window;
+        engine_params.vision_kv_score_layers = p.vision_kv_score_layers;
+        engine_params.vision_kv_pool_kernel = p.vision_kv_pool_kernel;
+        engine_params.vision_kv_keep_ratio = p.vision_kv_keep_ratio;
+        engine_params.cache_type_k = p.cache_type_k;
+        engine_params.cache_type_v = p.cache_type_v;
+        engine_params.flash_attention_mode = p.flash_attention_mode;
         engine_params.yarn_original_context = p.yarn_orig_ctx;
         engine_params.yarn_factor = p.yarn_factor;
         engine_params.vision_gpu = p.vision_gpu;
         engine_params.prefix_cache = p.prefix_cache;
+        engine_params.generation_block_cache = p.generation_block_cache;
+        engine_params.sparse_generation_logits = p.sparse_generation_logits;
+        engine_params.release_vision_after_encode = p.release_vision_after_encode;
+        engine_params.vision_kv_compression = p.vision_kv_compression;
+        engine_params.print_timings = p.print_timings;
 
-        d2f_request request;
-        request.image_path = p.image;
-        request.prompt = p.prompt;
-        request.retrieval_query = p.retrieval_query;
-        request.full_page_tile_size = p.full_page_tile_size;
-        request.tile_retrieval_topk = p.tile_retrieval_topk;
-        request.tile_retrieval_mask_rounds = p.tile_retrieval_mask_rounds;
-        request.full_page_tiles = p.full_page_tiles;
-        request.full_page_overview = p.full_page_overview;
-        request.preprocess_only = p.preprocess_only;
+        if (!p.input_jsonl.empty()) {
+            return run_batch(p, engine_params);
+        }
+
+        const d2f_request request = make_request(p, p.image, p.prompt, p.retrieval_query, {});
 
         d2f_engine engine(engine_params);
         d2f_result result;

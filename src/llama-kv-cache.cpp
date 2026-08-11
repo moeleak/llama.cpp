@@ -1338,6 +1338,287 @@ ggml_tensor * llama_kv_cache::get_k_storage(int32_t il) const {
     return layers[ikv].k;
 }
 
+bool llama_kv_cache::compact_heads(
+              llama_seq_id   seq_id,
+                 uint32_t   prefix_len,
+                 uint32_t   n_keep,
+          const uint32_t * src_ordinals,
+                   size_t   n_src_ordinals,
+        const llama_pos * dst_positions) {
+    if (n_stream != 1 || n_seq_max != 1 || seq_id != 0) {
+        LLAMA_LOG_ERROR("%s: requires a unified single-sequence cache with sequence id 0\n", __func__);
+        return false;
+    }
+    if (other || v_cells_impl.use_count() != 1) {
+        LLAMA_LOG_ERROR("%s: shared KV caches are not supported\n", __func__);
+        return false;
+    }
+    if (n_swa != 0 || swa_type != LLAMA_SWA_TYPE_NONE) {
+        LLAMA_LOG_ERROR("%s: SWA caches are not supported\n", __func__);
+        return false;
+    }
+    if (get_has_shift()) {
+        LLAMA_LOG_ERROR("%s: shifted KV cells are not supported\n", __func__);
+        return false;
+    }
+    if (!sc_info.empty()) {
+        LLAMA_LOG_ERROR("%s: pending stream copies must be applied before compaction\n", __func__);
+        return false;
+    }
+    if (msa_strict_slots) {
+        LLAMA_LOG_ERROR("%s: indexer KV caches are not supported\n", __func__);
+        return false;
+    }
+    if (layers.empty()) {
+        LLAMA_LOG_ERROR("%s: KV cache has no attention layers\n", __func__);
+        return false;
+    }
+    if (n_keep > prefix_len || prefix_len > get_size()) {
+        LLAMA_LOG_ERROR("%s: invalid lengths: keep = %u, prefix = %u, cache = %u\n", __func__, n_keep, prefix_len, get_size());
+        return false;
+    }
+    if (n_keep > 0 && (!src_ordinals || !dst_positions)) {
+        LLAMA_LOG_ERROR("%s: null source ordinals or destination positions\n", __func__);
+        return false;
+    }
+
+    auto & cells = v_cells[0];
+    if (cells.get_used() != prefix_len || cells.used_min() != 0 || cells.used_max_p1() != prefix_len) {
+        LLAMA_LOG_ERROR("%s: cache is not a fresh contiguous prefix: used = %u, range = [%u, %u), prefix = %u\n",
+                __func__, cells.get_used(), cells.used_min(), cells.used_max_p1(), prefix_len);
+        return false;
+    }
+
+    for (uint32_t i = 0; i < prefix_len; ++i) {
+        if (cells.is_empty(i) || cells.seq_count(i) != 1 || !cells.seq_has(i, seq_id) || cells.get_shift(i) != 0) {
+            LLAMA_LOG_ERROR("%s: cell %u does not belong exclusively to sequence %d\n", __func__, i, seq_id);
+            return false;
+        }
+    }
+
+    const uint32_t n_head_kv = hparams.n_head_kv(layers[0].il);
+    if (n_head_kv == 0) {
+        LLAMA_LOG_ERROR("%s: first cache layer has no KV heads\n", __func__);
+        return false;
+    }
+    if (layers.size() > SIZE_MAX/n_head_kv || layers.size()*n_head_kv > SIZE_MAX/std::max(n_keep, 1u)) {
+        LLAMA_LOG_ERROR("%s: source ordinal shape overflows size_t\n", __func__);
+        return false;
+    }
+
+    const size_t n_expected = layers.size()*n_head_kv*n_keep;
+    if (n_src_ordinals != n_expected) {
+        LLAMA_LOG_ERROR("%s: expected %zu source ordinals for %zu layers x %u heads x %u kept tokens, got %zu\n",
+                __func__, n_expected, layers.size(), n_head_kv, n_keep, n_src_ordinals);
+        return false;
+    }
+
+    size_t max_k_src = 0;
+    size_t max_k_dst = 0;
+    size_t max_v_src = 0;
+    size_t max_v_dst = 0;
+
+    for (size_t il = 0; il < layers.size(); ++il) {
+        const auto & layer = layers[il];
+        if (!layer.k || !layer.v || layer.k_idx) {
+            LLAMA_LOG_ERROR("%s: layer %u does not have a plain K/V cache\n", __func__, layer.il);
+            return false;
+        }
+        if (hparams.n_head_kv(layer.il) != n_head_kv) {
+            LLAMA_LOG_ERROR("%s: layer %u has %u KV heads, expected %u\n",
+                    __func__, layer.il, hparams.n_head_kv(layer.il), n_head_kv);
+            return false;
+        }
+
+        const uint32_t n_embd_head_k = hparams.n_embd_head_k(layer.il);
+        const uint32_t n_embd_head_v = hparams.n_embd_head_v(layer.il);
+        const uint64_t n_embd_k_gqa  = uint64_t(n_embd_head_k)*n_head_kv;
+        const uint64_t n_embd_v_gqa  = uint64_t(n_embd_head_v)*n_head_kv;
+
+        if (!ggml_is_contiguous(layer.k) || layer.k->ne[0] != (int64_t) n_embd_k_gqa ||
+                layer.k->ne[1] != (int64_t) get_size() || layer.k->ne[2] != 1 || layer.k->ne[3] != 1) {
+            LLAMA_LOG_ERROR("%s: layer %u has an unsupported K layout\n", __func__, layer.il);
+            return false;
+        }
+
+        const size_t k_head_bytes = ggml_row_size(layer.k->type, n_embd_head_k);
+        const size_t k_row_bytes  = ggml_row_size(layer.k->type, n_embd_k_gqa);
+        if (n_embd_head_k % ggml_blck_size(layer.k->type) != 0 || k_head_bytes*n_head_kv != k_row_bytes) {
+            LLAMA_LOG_ERROR("%s: layer %u K type %s cannot be split at KV-head boundaries\n",
+                    __func__, layer.il, ggml_type_name(layer.k->type));
+            return false;
+        }
+
+        if (!ggml_is_contiguous(layer.v) || layer.v->ne[0] != (int64_t) n_embd_v_gqa ||
+                layer.v->ne[1] != (int64_t) get_size() || layer.v->ne[2] != 1 || layer.v->ne[3] != 1) {
+            LLAMA_LOG_ERROR("%s: layer %u has an unsupported V layout\n", __func__, layer.il);
+            return false;
+        }
+
+        size_t v_row_bytes = 0;
+        if (v_trans) {
+            if (layer.v->type != GGML_TYPE_F16) {
+                LLAMA_LOG_ERROR("%s: layer %u transposed V type %s is unsupported; expected f16\n",
+                        __func__, layer.il, ggml_type_name(layer.v->type));
+                return false;
+            }
+            v_row_bytes = n_embd_v_gqa*sizeof(ggml_fp16_t);
+        } else {
+            const size_t v_head_bytes = ggml_row_size(layer.v->type, n_embd_head_v);
+            v_row_bytes = ggml_row_size(layer.v->type, n_embd_v_gqa);
+            if (n_embd_head_v % ggml_blck_size(layer.v->type) != 0 || v_head_bytes*n_head_kv != v_row_bytes) {
+                LLAMA_LOG_ERROR("%s: layer %u V type %s cannot be split at KV-head boundaries\n",
+                        __func__, layer.il, ggml_type_name(layer.v->type));
+                return false;
+            }
+        }
+
+        if (prefix_len > SIZE_MAX/k_row_bytes || n_keep > SIZE_MAX/k_row_bytes ||
+                prefix_len > SIZE_MAX/v_row_bytes || n_keep > SIZE_MAX/v_row_bytes) {
+            LLAMA_LOG_ERROR("%s: layer %u staging size overflows size_t\n", __func__, layer.il);
+            return false;
+        }
+
+        max_k_src = std::max(max_k_src, size_t(prefix_len)*k_row_bytes);
+        max_k_dst = std::max(max_k_dst, size_t(n_keep)*k_row_bytes);
+        max_v_src = std::max(max_v_src, size_t(prefix_len)*v_row_bytes);
+        max_v_dst = std::max(max_v_dst, size_t(n_keep)*v_row_bytes);
+
+        const size_t layer_off = il*n_head_kv*n_keep;
+        for (uint32_t ih = 0; ih < n_head_kv; ++ih) {
+            const size_t head_off = layer_off + size_t(ih)*n_keep;
+            for (uint32_t idst = 0; idst < n_keep; ++idst) {
+                const uint32_t isrc = src_ordinals[head_off + idst];
+                if (isrc >= prefix_len) {
+                    LLAMA_LOG_ERROR("%s: layer %u head %u destination %u has source ordinal %u outside prefix %u\n",
+                            __func__, layer.il, ih, idst, isrc, prefix_len);
+                    return false;
+                }
+                if (idst > 0 && src_ordinals[head_off + idst - 1] >= isrc) {
+                    LLAMA_LOG_ERROR("%s: layer %u head %u source ordinals are not strictly increasing\n", __func__, layer.il, ih);
+                    return false;
+                }
+                if (cells.pos_get(isrc) != dst_positions[idst]) {
+                    LLAMA_LOG_ERROR("%s: layer %u head %u destination %u changes position from %d to %d\n",
+                            __func__, layer.il, ih, idst, cells.pos_get(isrc), dst_positions[idst]);
+                    return false;
+                }
+
+                const uint32_t canonical = src_ordinals[idst];
+                const auto & ext_src = cells.ext_get(isrc);
+                const auto & ext_dst = cells.ext_get(canonical);
+                if (ext_src.x != ext_dst.x || ext_src.y != ext_dst.y) {
+                    LLAMA_LOG_ERROR("%s: layer %u head %u destination %u has incompatible extended positions\n",
+                            __func__, layer.il, ih, idst);
+                    return false;
+                }
+            }
+        }
+    }
+
+    llama_kv_cells compacted;
+    compacted.resize(n_keep);
+    for (uint32_t idst = 0; idst < n_keep; ++idst) {
+        const uint32_t canonical = src_ordinals[idst];
+        compacted.pos_set(idst, dst_positions[idst]);
+        compacted.ext_set(idst, cells.ext_get(canonical));
+        compacted.seq_add(idst, seq_id);
+    }
+
+    try {
+        std::vector<uint8_t> k_src(max_k_src);
+        std::vector<uint8_t> k_dst(max_k_dst);
+        std::vector<uint8_t> v_src(max_v_src);
+        std::vector<uint8_t> v_dst(max_v_dst);
+
+        for (size_t il = 0; il < layers.size(); ++il) {
+            auto & layer = layers[il];
+
+            const uint32_t n_embd_head_k = hparams.n_embd_head_k(layer.il);
+            const uint32_t n_embd_head_v = hparams.n_embd_head_v(layer.il);
+            const uint64_t n_embd_k_gqa  = uint64_t(n_embd_head_k)*n_head_kv;
+            const uint64_t n_embd_v_gqa  = uint64_t(n_embd_head_v)*n_head_kv;
+
+            const size_t k_head_bytes = ggml_row_size(layer.k->type, n_embd_head_k);
+            const size_t k_row_bytes  = ggml_row_size(layer.k->type, n_embd_k_gqa);
+            const size_t k_src_bytes  = size_t(prefix_len)*k_row_bytes;
+            const size_t k_dst_bytes  = size_t(n_keep)*k_row_bytes;
+            const size_t layer_off    = il*n_head_kv*n_keep;
+
+            ggml_backend_tensor_get(layer.k, k_src.data(), 0, k_src_bytes);
+            for (uint32_t idst = 0; idst < n_keep; ++idst) {
+                for (uint32_t ih = 0; ih < n_head_kv; ++ih) {
+                    const uint32_t isrc = src_ordinals[layer_off + size_t(ih)*n_keep + idst];
+                    memcpy(k_dst.data() + size_t(idst)*k_row_bytes + size_t(ih)*k_head_bytes,
+                           k_src.data() + size_t(isrc)*k_row_bytes + size_t(ih)*k_head_bytes,
+                           k_head_bytes);
+                }
+            }
+
+            size_t v_dst_bytes = 0;
+            if (v_trans) {
+                const size_t elem_bytes   = sizeof(ggml_fp16_t);
+                const size_t src_stride_t = size_t(get_size())*elem_bytes;
+                const size_t src_stride_h = size_t(prefix_len)*elem_bytes;
+                const size_t dst_stride_h = size_t(n_keep)*elem_bytes;
+                v_dst_bytes = size_t(n_keep)*n_embd_v_gqa*elem_bytes;
+
+                ggml_backend_tensor_get_2d(
+                        layer.v, v_src.data(), 0, src_stride_h, n_embd_v_gqa, src_stride_t, src_stride_h);
+                for (uint32_t ih = 0; ih < n_head_kv; ++ih) {
+                    for (uint32_t idim = 0; idim < n_embd_head_v; ++idim) {
+                        const size_t iembd = size_t(ih)*n_embd_head_v + idim;
+                        for (uint32_t idst = 0; idst < n_keep; ++idst) {
+                            const uint32_t isrc = src_ordinals[layer_off + size_t(ih)*n_keep + idst];
+                            memcpy(v_dst.data() + iembd*dst_stride_h + size_t(idst)*elem_bytes,
+                                   v_src.data() + iembd*src_stride_h + size_t(isrc)*elem_bytes,
+                                   elem_bytes);
+                        }
+                    }
+                }
+            } else {
+                const size_t v_head_bytes = ggml_row_size(layer.v->type, n_embd_head_v);
+                const size_t v_row_bytes  = ggml_row_size(layer.v->type, n_embd_v_gqa);
+                const size_t v_src_bytes  = size_t(prefix_len)*v_row_bytes;
+                v_dst_bytes = size_t(n_keep)*v_row_bytes;
+
+                ggml_backend_tensor_get(layer.v, v_src.data(), 0, v_src_bytes);
+                for (uint32_t idst = 0; idst < n_keep; ++idst) {
+                    for (uint32_t ih = 0; ih < n_head_kv; ++ih) {
+                        const uint32_t isrc = src_ordinals[layer_off + size_t(ih)*n_keep + idst];
+                        memcpy(v_dst.data() + size_t(idst)*v_row_bytes + size_t(ih)*v_head_bytes,
+                               v_src.data() + size_t(isrc)*v_row_bytes + size_t(ih)*v_head_bytes,
+                               v_head_bytes);
+                    }
+                }
+            }
+
+            ggml_backend_tensor_set(layer.k, k_dst.data(), 0, k_dst_bytes);
+            if (v_trans) {
+                const size_t elem_bytes   = sizeof(ggml_fp16_t);
+                const size_t dst_stride_t = size_t(get_size())*elem_bytes;
+                const size_t dst_stride_h = size_t(n_keep)*elem_bytes;
+                ggml_backend_tensor_set_2d(
+                        layer.v, v_dst.data(), 0, dst_stride_h, n_embd_v_gqa, dst_stride_t, dst_stride_h);
+            } else {
+                ggml_backend_tensor_set(layer.v, v_dst.data(), 0, v_dst_bytes);
+            }
+        }
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("%s: host staging failed: %s\n", __func__, e.what());
+        return false;
+    }
+
+    cells.reset();
+    cells.set(0, compacted);
+    v_heads[0] = n_keep;
+
+    LLAMA_LOG_INFO("%s: compacted %u KV cells to %u across %zu layers and %u KV heads\n",
+            __func__, prefix_len, n_keep, layers.size(), n_head_kv);
+
+    return true;
+}
+
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     uint32_t result = 0;
 

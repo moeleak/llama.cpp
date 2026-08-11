@@ -195,29 +195,39 @@ std::vector<diffusion_d2f_candidate> diffusion_d2f_argmax_candidates(const float
             continue;
         }
 
-        const float * row_logits = logits + static_cast<size_t>(row) * n_vocab;
-        int32_t       token      = 0;
-        for (int32_t id = 1; id < n_vocab; ++id) {
-            if (row_logits[id] > row_logits[token]) {
-                token = id;
-            }
-        }
-
-        const float maximum = row_logits[token];
-        if (!std::isfinite(maximum)) {
-            continue;
-        }
-        double denominator = 0.0;
-        for (int32_t id = 0; id < n_vocab; ++id) {
-            denominator += std::exp(static_cast<double>(row_logits[id] - maximum));
-        }
-        if (!std::isfinite(denominator) || denominator <= 0.0) {
-            continue;
-        }
-
-        result[target] = { token, static_cast<float>(1.0 / denominator), true };
+        result[target] = diffusion_d2f_argmax_candidate(
+                logits + static_cast<size_t>(row) * n_vocab,
+                n_vocab);
     }
     return result;
+}
+
+diffusion_d2f_candidate diffusion_d2f_argmax_candidate(
+        const float * logits,
+        int32_t n_vocab) {
+    if (!logits || n_vocab <= 0) {
+        throw std::invalid_argument("invalid D2F logits row");
+    }
+
+    int32_t token = 0;
+    for (int32_t id = 1; id < n_vocab; ++id) {
+        if (logits[id] > logits[token]) {
+            token = id;
+        }
+    }
+
+    const float maximum = logits[token];
+    if (!std::isfinite(maximum)) {
+        return {};
+    }
+    double denominator = 0.0;
+    for (int32_t id = 0; id < n_vocab; ++id) {
+        denominator += std::exp(static_cast<double>(logits[id] - maximum));
+    }
+    if (!std::isfinite(denominator) || denominator <= 0.0) {
+        return {};
+    }
+    return { token, static_cast<float>(1.0 / denominator), true };
 }
 
 bool diffusion_d2f_attention_allowed(int32_t query_position,

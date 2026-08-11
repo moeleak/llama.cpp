@@ -164,6 +164,14 @@ public:
     std::vector<uint32_t> get_layer_ids() const;
     ggml_tensor * get_k_storage(int32_t il) const;
 
+    bool compact_heads(
+                  llama_seq_id   seq_id,
+                     uint32_t   prefix_len,
+                     uint32_t   n_keep,
+              const uint32_t * src_ordinals,
+                       size_t   n_src_ordinals,
+            const llama_pos * dst_positions);
+
     //
     // graph_build API
     //

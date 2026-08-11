@@ -73,6 +73,14 @@ struct llama_context {
 
     llama_memory_t get_memory() const;
 
+    bool kv_cache_compact_heads(
+                  llama_seq_id   seq_id,
+                     uint32_t   prefix_len,
+                     uint32_t   n_keep,
+              const uint32_t * src_ordinals,
+                       size_t   n_src_ordinals,
+            const llama_pos * dst_positions);
+
     // return true if the memory was updated
     bool memory_update(bool optimize);
 

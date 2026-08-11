@@ -77,6 +77,9 @@ std::vector<diffusion_d2f_candidate> diffusion_d2f_argmax_candidates(const float
                                                                      int32_t       n_targets,
                                                                      bool          shift_logits);
 
+diffusion_d2f_candidate diffusion_d2f_argmax_candidate(const float * logits,
+                                                       int32_t       n_vocab);
+
 bool diffusion_d2f_attention_allowed(int32_t query_position,
                                      int32_t key_position,
                                      int32_t prompt_length,
