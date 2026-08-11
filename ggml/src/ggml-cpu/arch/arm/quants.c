@@ -2015,9 +2015,290 @@ void ggml_vec_dot_q2_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
 #endif
 }
 
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+static inline void ggml_decode_q3_K_scales(const uint8_t * scales, int8_t * decoded) {
+    const uint8x8_t packed = vld1_u8(scales);
+    uint32_t high_word;
+    memcpy(&high_word, scales + 8, sizeof(high_word));
+
+    // Unpack two scale groups at once without scalar temporaries.
+    const uint8x8_t high = vreinterpret_u8_u32(vdup_n_u32(high_word));
+    const int8x8_t shift_low  = { 4, 4, 4, 4,  2,  2,  2,  2 };
+    const int8x8_t shift_high = { 0, 0, 0, 0, -2, -2, -2, -2 };
+    const uint8x8_t high_mask = vdup_n_u8(0x30);
+    const uint8x8_t low_nibbles = vorr_u8(
+            vand_u8(packed, vdup_n_u8(0x0f)),
+            vand_u8(vshl_u8(high, shift_low), high_mask));
+    const uint8x8_t high_nibbles = vorr_u8(
+            vshr_n_u8(packed, 4),
+            vand_u8(vshl_u8(high, shift_high), high_mask));
+    const int8x16_t unpacked = vreinterpretq_s8_u8(vcombine_u8(low_nibbles, high_nibbles));
+    vst1q_s8(decoded, vsubq_s8(unpacked, vdupq_n_s8(32)));
+}
+
+static inline void ggml_decode_q3_K_128(const uint8_t * qs, const uint8_t * hmask, int high_half, int8x16_t decoded[8]) {
+    const uint8x16_t m3b = vdupq_n_u8(0x03);
+    const uint8x16_t m0  = vdupq_n_u8(0x01);
+    const uint8x16_t m1  = vdupq_n_u8(0x02);
+    const uint8x16_t m2  = vdupq_n_u8(0x04);
+    const uint8x16_t m3  = vdupq_n_u8(0x08);
+
+    const uint8x16x2_t q3bits = vld1q_u8_x2(qs);
+    uint8x16x2_t qhbits = vld1q_u8_x2(hmask);
+    if (high_half) {
+        qhbits.val[0] = vshrq_n_u8(qhbits.val[0], 4);
+        qhbits.val[1] = vshrq_n_u8(qhbits.val[1], 4);
+    }
+
+    decoded[0] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(q3bits.val[0], m3b)),
+            vreinterpretq_s8_u8(vshlq_n_u8(vbicq_u8(m0, qhbits.val[0]), 2)));
+    decoded[1] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(q3bits.val[1], m3b)),
+            vreinterpretq_s8_u8(vshlq_n_u8(vbicq_u8(m0, qhbits.val[1]), 2)));
+    decoded[2] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[0], 2), m3b)),
+            vreinterpretq_s8_u8(vshlq_n_u8(vbicq_u8(m1, qhbits.val[0]), 1)));
+    decoded[3] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[1], 2), m3b)),
+            vreinterpretq_s8_u8(vshlq_n_u8(vbicq_u8(m1, qhbits.val[1]), 1)));
+    decoded[4] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[0], 4), m3b)),
+            vreinterpretq_s8_u8(vbicq_u8(m2, qhbits.val[0])));
+    decoded[5] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[1], 4), m3b)),
+            vreinterpretq_s8_u8(vbicq_u8(m2, qhbits.val[1])));
+    decoded[6] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[0], 6), m3b)),
+            vreinterpretq_s8_u8(vshrq_n_u8(vbicq_u8(m3, qhbits.val[0]), 1)));
+    decoded[7] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits.val[1], 6), m3b)),
+            vreinterpretq_s8_u8(vshrq_n_u8(vbicq_u8(m3, qhbits.val[1]), 1)));
+}
+
+__attribute__((noinline))
+void ggml_vec_dot_q3_K_q8_K_4x4(
+        int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, size_t bx,
+        const void * GGML_RESTRICT vy, size_t by) {
+    const int nb = n / QK_K;
+    const block_q3_K * GGML_RESTRICT x_rows[4] = {
+        (const block_q3_K *) vx,
+        (const block_q3_K *) ((const uint8_t *) vx + bx),
+        (const block_q3_K *) ((const uint8_t *) vx + 2 * bx),
+        (const block_q3_K *) ((const uint8_t *) vx + 3 * bx),
+    };
+    const block_q8_K * GGML_RESTRICT y_rows[4] = {
+        (const block_q8_K *) vy,
+        (const block_q8_K *) ((const uint8_t *) vy + by),
+        (const block_q8_K *) ((const uint8_t *) vy + 2 * by),
+        (const block_q8_K *) ((const uint8_t *) vy + 3 * by),
+    };
+
+    // Keep each Q3 row pair live across both activation row pairs to avoid repeated decoding.
+    float32x4_t vfsum[2][2] = {
+        { vdupq_n_f32(0.0f), vdupq_n_f32(0.0f) },
+        { vdupq_n_f32(0.0f), vdupq_n_f32(0.0f) },
+    };
+
+    for (int i = 0; i < nb; ++i) {
+        int8_t scales[4][16];
+        for (int row = 0; row < 4; ++row) {
+            ggml_decode_q3_K_scales(x_rows[row][i].scales, scales[row]);
+        }
+
+        int32x4_t visum[2][2] = {
+            { vdupq_n_s32(0), vdupq_n_s32(0) },
+            { vdupq_n_s32(0), vdupq_n_s32(0) },
+        };
+
+        for (int j = 0; j < QK_K / 128; ++j) {
+            for (int weight_pair = 0; weight_pair < 2; ++weight_pair) {
+                const int weight0 = 2 * weight_pair;
+                const int weight1 = weight0 + 1;
+                int8x16_t qx0[8];
+                int8x16_t qx1[8];
+                ggml_decode_q3_K_128(
+                        x_rows[weight0][i].qs + j * 32, x_rows[weight0][i].hmask, j, qx0);
+                ggml_decode_q3_K_128(
+                        x_rows[weight1][i].qs + j * 32, x_rows[weight1][i].hmask, j, qx1);
+
+                for (int k = 0; k < 8; ++k) {
+                    const int blk = j * 8 + k;
+                    const int8x16_t qx_l = vreinterpretq_s8_s64(vzip1q_s64(
+                            vreinterpretq_s64_s8(qx0[k]), vreinterpretq_s64_s8(qx1[k])));
+                    const int8x16_t qx_h = vreinterpretq_s8_s64(vzip2q_s64(
+                            vreinterpretq_s64_s8(qx0[k]), vreinterpretq_s64_s8(qx1[k])));
+                    const int32x4_t block_scale = {
+                        scales[weight0][blk], scales[weight0][blk],
+                        scales[weight1][blk], scales[weight1][blk],
+                    };
+
+                    for (int activation_pair = 0; activation_pair < 2; ++activation_pair) {
+                        const int activation0 = 2 * activation_pair;
+                        const int activation1 = activation0 + 1;
+                        const int8x16_t qy0 = vld1q_s8(y_rows[activation0][i].qs + blk * 16);
+                        const int8x16_t qy1 = vld1q_s8(y_rows[activation1][i].qs + blk * 16);
+                        const int8x16_t qy_l = vreinterpretq_s8_s64(vzip1q_s64(
+                                vreinterpretq_s64_s8(qy0), vreinterpretq_s64_s8(qy1)));
+                        const int8x16_t qy_h = vreinterpretq_s8_s64(vzip2q_s64(
+                                vreinterpretq_s64_s8(qy0), vreinterpretq_s64_s8(qy1)));
+
+                        int32x4_t vr = vdupq_n_s32(0);
+                        vr = vmmlaq_s32(vr, qx_l, qy_l);
+                        vr = vmmlaq_s32(vr, qx_h, qy_h);
+                        visum[weight_pair][activation_pair] = vmlaq_s32(
+                                visum[weight_pair][activation_pair], vr, block_scale);
+                    }
+                }
+            }
+        }
+
+        for (int weight_pair = 0; weight_pair < 2; ++weight_pair) {
+            const int weight0 = 2 * weight_pair;
+            const int weight1 = weight0 + 1;
+            const float dx0 = GGML_CPU_FP16_TO_FP32(x_rows[weight0][i].d);
+            const float dx1 = GGML_CPU_FP16_TO_FP32(x_rows[weight1][i].d);
+            for (int activation_pair = 0; activation_pair < 2; ++activation_pair) {
+                const int activation0 = 2 * activation_pair;
+                const int activation1 = activation0 + 1;
+                const float32x4_t superblock_scale = {
+                    dx0 * y_rows[activation0][i].d,
+                    dx0 * y_rows[activation1][i].d,
+                    dx1 * y_rows[activation0][i].d,
+                    dx1 * y_rows[activation1][i].d,
+                };
+                vfsum[weight_pair][activation_pair] = vmlaq_f32(
+                        vfsum[weight_pair][activation_pair],
+                        vcvtq_f32_s32(visum[weight_pair][activation_pair]), superblock_scale);
+            }
+        }
+    }
+
+    for (int weight_pair = 0; weight_pair < 2; ++weight_pair) {
+        for (int activation_pair = 0; activation_pair < 2; ++activation_pair) {
+            const float32x4_t tile = vzip1q_f32(
+                    vfsum[weight_pair][activation_pair],
+                    vextq_f32(vfsum[weight_pair][activation_pair], vfsum[weight_pair][activation_pair], 2));
+            vst1_f32(s + (2 * activation_pair) * bs + 2 * weight_pair, vget_low_f32(tile));
+            vst1_f32(s + (2 * activation_pair + 1) * bs + 2 * weight_pair, vget_high_f32(tile));
+        }
+    }
+}
+
+__attribute__((noinline))
+void ggml_vec_dot_q3_K_q8_K_4x8(
+        int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, size_t bx,
+        const void * GGML_RESTRICT vy, size_t by) {
+    const int nb = n / QK_K;
+    const block_q3_K * GGML_RESTRICT x_rows[4] = {
+        (const block_q3_K *) vx,
+        (const block_q3_K *) ((const uint8_t *) vx + bx),
+        (const block_q3_K *) ((const uint8_t *) vx + 2 * bx),
+        (const block_q3_K *) ((const uint8_t *) vx + 3 * bx),
+    };
+    const block_q8_K * GGML_RESTRICT y_rows[8] = {
+        (const block_q8_K *) vy,
+        (const block_q8_K *) ((const uint8_t *) vy + by),
+        (const block_q8_K *) ((const uint8_t *) vy + 2 * by),
+        (const block_q8_K *) ((const uint8_t *) vy + 3 * by),
+        (const block_q8_K *) ((const uint8_t *) vy + 4 * by),
+        (const block_q8_K *) ((const uint8_t *) vy + 5 * by),
+        (const block_q8_K *) ((const uint8_t *) vy + 6 * by),
+        (const block_q8_K *) ((const uint8_t *) vy + 7 * by),
+    };
+
+    float32x4_t vfsum[2][4] = {
+        { vdupq_n_f32(0.0f), vdupq_n_f32(0.0f), vdupq_n_f32(0.0f), vdupq_n_f32(0.0f) },
+        { vdupq_n_f32(0.0f), vdupq_n_f32(0.0f), vdupq_n_f32(0.0f), vdupq_n_f32(0.0f) },
+    };
+
+    for (int i = 0; i < nb; ++i) {
+        int8_t scales[4][16];
+        for (int row = 0; row < 4; ++row) {
+            ggml_decode_q3_K_scales(x_rows[row][i].scales, scales[row]);
+        }
+
+        int32x4_t visum[2][4] = {
+            { vdupq_n_s32(0), vdupq_n_s32(0), vdupq_n_s32(0), vdupq_n_s32(0) },
+            { vdupq_n_s32(0), vdupq_n_s32(0), vdupq_n_s32(0), vdupq_n_s32(0) },
+        };
+
+        for (int j = 0; j < QK_K / 128; ++j) {
+            for (int weight_pair = 0; weight_pair < 2; ++weight_pair) {
+                const int weight0 = 2 * weight_pair;
+                const int weight1 = weight0 + 1;
+                int8x16_t qx0[8];
+                int8x16_t qx1[8];
+                ggml_decode_q3_K_128(
+                        x_rows[weight0][i].qs + j * 32, x_rows[weight0][i].hmask, j, qx0);
+                ggml_decode_q3_K_128(
+                        x_rows[weight1][i].qs + j * 32, x_rows[weight1][i].hmask, j, qx1);
+
+                for (int k = 0; k < 8; ++k) {
+                    const int blk = j * 8 + k;
+                    const int8x16_t qx_l = vreinterpretq_s8_s64(vzip1q_s64(
+                            vreinterpretq_s64_s8(qx0[k]), vreinterpretq_s64_s8(qx1[k])));
+                    const int8x16_t qx_h = vreinterpretq_s8_s64(vzip2q_s64(
+                            vreinterpretq_s64_s8(qx0[k]), vreinterpretq_s64_s8(qx1[k])));
+                    const int32x4_t block_scale = {
+                        scales[weight0][blk], scales[weight0][blk],
+                        scales[weight1][blk], scales[weight1][blk],
+                    };
+
+                    for (int activation_pair = 0; activation_pair < 4; ++activation_pair) {
+                        const int activation0 = 2 * activation_pair;
+                        const int activation1 = activation0 + 1;
+                        const int8x16_t qy0 = vld1q_s8(y_rows[activation0][i].qs + blk * 16);
+                        const int8x16_t qy1 = vld1q_s8(y_rows[activation1][i].qs + blk * 16);
+                        const int8x16_t qy_l = vreinterpretq_s8_s64(vzip1q_s64(
+                                vreinterpretq_s64_s8(qy0), vreinterpretq_s64_s8(qy1)));
+                        const int8x16_t qy_h = vreinterpretq_s8_s64(vzip2q_s64(
+                                vreinterpretq_s64_s8(qy0), vreinterpretq_s64_s8(qy1)));
+
+                        int32x4_t vr = vdupq_n_s32(0);
+                        vr = vmmlaq_s32(vr, qx_l, qy_l);
+                        vr = vmmlaq_s32(vr, qx_h, qy_h);
+                        visum[weight_pair][activation_pair] = vmlaq_s32(
+                                visum[weight_pair][activation_pair], vr, block_scale);
+                    }
+                }
+            }
+        }
+
+        for (int weight_pair = 0; weight_pair < 2; ++weight_pair) {
+            const int weight0 = 2 * weight_pair;
+            const int weight1 = weight0 + 1;
+            const float dx0 = GGML_CPU_FP16_TO_FP32(x_rows[weight0][i].d);
+            const float dx1 = GGML_CPU_FP16_TO_FP32(x_rows[weight1][i].d);
+            for (int activation_pair = 0; activation_pair < 4; ++activation_pair) {
+                const int activation0 = 2 * activation_pair;
+                const int activation1 = activation0 + 1;
+                const float32x4_t superblock_scale = {
+                    dx0 * y_rows[activation0][i].d,
+                    dx0 * y_rows[activation1][i].d,
+                    dx1 * y_rows[activation0][i].d,
+                    dx1 * y_rows[activation1][i].d,
+                };
+                vfsum[weight_pair][activation_pair] = vmlaq_f32(
+                        vfsum[weight_pair][activation_pair],
+                        vcvtq_f32_s32(visum[weight_pair][activation_pair]), superblock_scale);
+            }
+        }
+    }
+
+    for (int weight_pair = 0; weight_pair < 2; ++weight_pair) {
+        for (int activation_pair = 0; activation_pair < 4; ++activation_pair) {
+            const float32x4_t tile = vzip1q_f32(
+                    vfsum[weight_pair][activation_pair],
+                    vextq_f32(vfsum[weight_pair][activation_pair], vfsum[weight_pair][activation_pair], 2));
+            vst1_f32(s + (2 * activation_pair) * bs + 2 * weight_pair, vget_low_f32(tile));
+            vst1_f32(s + (2 * activation_pair + 1) * bs + 2 * weight_pair, vget_high_f32(tile));
+        }
+    }
+}
+#endif
+
 void ggml_vec_dot_q3_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(n % QK_K == 0);
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+    assert((nrc == 2) || (nrc == 1));
+#else
     assert(nrc == 1);
+#endif
     UNUSED(nrc);
     UNUSED(bx);
     UNUSED(by);
@@ -2030,6 +2311,69 @@ void ggml_vec_dot_q3_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
     const block_q8_K * GGML_RESTRICT y = vy;
 
     const int nb = n / QK_K;
+
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+    if (nrc == 2) {
+        const block_q3_K * GGML_RESTRICT x0 = x;
+        const block_q3_K * GGML_RESTRICT x1 = (const block_q3_K *) ((const uint8_t *) vx + bx);
+        const block_q8_K * GGML_RESTRICT y0 = y;
+        const block_q8_K * GGML_RESTRICT y1 = (const block_q8_K *) ((const uint8_t *) vy + by);
+
+        float32x4_t vfsum = vdupq_n_f32(0.0f);
+
+        for (int i = 0; i < nb; ++i, ++x0, ++x1, ++y0, ++y1) {
+            int8_t scales0[16];
+            int8_t scales1[16];
+            ggml_decode_q3_K_scales(x0->scales, scales0);
+            ggml_decode_q3_K_scales(x1->scales, scales1);
+
+            int32x4_t visum = vdupq_n_s32(0);
+            for (int j = 0; j < QK_K / 128; ++j) {
+                int8x16_t qx0[8];
+                int8x16_t qx1[8];
+                ggml_decode_q3_K_128(x0->qs + j * 32, x0->hmask, j, qx0);
+                ggml_decode_q3_K_128(x1->qs + j * 32, x1->hmask, j, qx1);
+
+                for (int k = 0; k < 8; ++k) {
+                    const int blk = j * 8 + k;
+                    const int8x16_t qy0 = vld1q_s8(y0->qs + blk * 16);
+                    const int8x16_t qy1 = vld1q_s8(y1->qs + blk * 16);
+
+                    const int8x16_t qx_l = vreinterpretq_s8_s64(vzip1q_s64(
+                            vreinterpretq_s64_s8(qx0[k]), vreinterpretq_s64_s8(qx1[k])));
+                    const int8x16_t qx_h = vreinterpretq_s8_s64(vzip2q_s64(
+                            vreinterpretq_s64_s8(qx0[k]), vreinterpretq_s64_s8(qx1[k])));
+                    const int8x16_t qy_l = vreinterpretq_s8_s64(vzip1q_s64(
+                            vreinterpretq_s64_s8(qy0), vreinterpretq_s64_s8(qy1)));
+                    const int8x16_t qy_h = vreinterpretq_s8_s64(vzip2q_s64(
+                            vreinterpretq_s64_s8(qy0), vreinterpretq_s64_s8(qy1)));
+
+                    int32x4_t vr = vdupq_n_s32(0);
+                    vr = vmmlaq_s32(vr, qx_l, qy_l);
+                    vr = vmmlaq_s32(vr, qx_h, qy_h);
+
+                    const int32x4_t block_scale = {
+                        scales0[blk], scales0[blk], scales1[blk], scales1[blk],
+                    };
+                    visum = vmlaq_s32(visum, vr, block_scale);
+                }
+            }
+
+            const float32x4_t superblock_scale = {
+                GGML_CPU_FP16_TO_FP32(x0->d) * y0->d,
+                GGML_CPU_FP16_TO_FP32(x0->d) * y1->d,
+                GGML_CPU_FP16_TO_FP32(x1->d) * y0->d,
+                GGML_CPU_FP16_TO_FP32(x1->d) * y1->d,
+            };
+            vfsum = vmlaq_f32(vfsum, vcvtq_f32_s32(visum), superblock_scale);
+        }
+
+        vfsum = vzip1q_f32(vfsum, vextq_f32(vfsum, vfsum, 2));
+        vst1_f32(s,      vget_low_f32(vfsum));
+        vst1_f32(s + bs, vget_high_f32(vfsum));
+        return;
+    }
+#endif
 
 #if defined(__ARM_FEATURE_SVE)
 

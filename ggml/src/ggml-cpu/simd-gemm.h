@@ -4,8 +4,101 @@
 
 #include "simd-mappings.h"
 
-// TODO: add support for sizeless vector types
-#if defined(GGML_SIMD) && !defined(__ARM_FEATURE_SVE) && !defined(__riscv_v_intrinsic)
+// SVE types are sizeless, so use fixed-width NEON registers on Arm SVE builds.
+#if defined(GGML_SIMD) && defined(__ARM_FEATURE_SVE) && defined(__ARM_NEON)
+
+static constexpr int GEMM_RM = 4;
+static constexpr int GEMM_RN = 4;
+
+template <int RM, int RN>
+static inline void simd_gemm_ukernel(
+    float       * GGML_RESTRICT C,
+    const float * GGML_RESTRICT A,
+    const float * GGML_RESTRICT B,
+    int K, int N)
+{
+    static constexpr int KN = 4;
+
+    float32x4_t acc[RM][RN];
+    for (int64_t i = 0; i < RM; i++) {
+        for (int r = 0; r < RN; r++) {
+            acc[i][r] = vld1q_f32(C + i * N + r * KN);
+        }
+    }
+
+    for (int64_t kk = 0; kk < K; kk++) {
+        float32x4_t Bv[RN];
+        for (int r = 0; r < RN; r++) {
+            Bv[r] = vld1q_f32(B + kk * N + r * KN);
+        }
+        for (int64_t i = 0; i < RM; i++) {
+            const float a = A[i * K + kk];
+            for (int r = 0; r < RN; r++) {
+                acc[i][r] = vfmaq_n_f32(acc[i][r], Bv[r], a);
+            }
+        }
+    }
+
+    for (int64_t i = 0; i < RM; i++) {
+        for (int r = 0; r < RN; r++) {
+            vst1q_f32(C + i * N + r * KN, acc[i][r]);
+        }
+    }
+}
+
+static void simd_gemm(
+    float       * GGML_RESTRICT C,
+    const float * GGML_RESTRICT A,
+    const float * GGML_RESTRICT B,
+    int M, int K, int N)
+{
+    static constexpr int KN = 4;
+
+    int64_t ii = 0;
+    for (; ii + GEMM_RM <= M; ii += GEMM_RM) {
+        int64_t jj = 0;
+        for (; jj + GEMM_RN * KN <= N; jj += GEMM_RN * KN) {
+            simd_gemm_ukernel<GEMM_RM, GEMM_RN>(C + jj, A, B + jj, K, N);
+        }
+        for (; jj + KN <= N; jj += KN) {
+            simd_gemm_ukernel<GEMM_RM, 1>(C + jj, A, B + jj, K, N);
+        }
+        for (; jj < N; jj++) {
+            for (int64_t i = 0; i < GEMM_RM; i++) {
+                float a = C[i * N + jj];
+                for (int64_t kk = 0; kk < K; kk++) {
+                    a += A[i * K + kk] * B[kk * N + jj];
+                }
+                C[i * N + jj] = a;
+            }
+        }
+
+        A += GEMM_RM * K;
+        C += GEMM_RM * N;
+    }
+
+    for (; ii < M; ii++) {
+        int64_t jj = 0;
+        for (; jj + GEMM_RN * KN <= N; jj += GEMM_RN * KN) {
+            simd_gemm_ukernel<1, GEMM_RN>(C + jj, A, B + jj, K, N);
+        }
+        for (; jj + KN <= N; jj += KN) {
+            simd_gemm_ukernel<1, 1>(C + jj, A, B + jj, K, N);
+        }
+        for (; jj < N; jj++) {
+            float a = C[jj];
+            for (int64_t kk = 0; kk < K; kk++) {
+                a += A[kk] * B[kk * N + jj];
+            }
+            C[jj] = a;
+        }
+
+        A += K;
+        C += N;
+    }
+}
+
+#elif defined(GGML_SIMD) && !defined(__ARM_FEATURE_SVE) && !defined(__riscv_v_intrinsic)
 
 // TODO: untested on avx512
 // These are in units of GGML_F32_EPR

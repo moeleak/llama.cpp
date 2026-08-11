@@ -305,7 +305,11 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .from_float               = quantize_row_q3_K,
         .vec_dot                  = ggml_vec_dot_q3_K_q8_K,
         .vec_dot_type             = GGML_TYPE_Q8_K,
+#if defined (__ARM_FEATURE_MATMUL_INT8)
+        .nrows                    = 2,
+#else
         .nrows                    = 1,
+#endif
     },
     [GGML_TYPE_Q4_K] = {
         .from_float               = quantize_row_q4_K,
@@ -1251,6 +1255,208 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     }
 }
 
+#if defined (__ARM_FEATURE_MATMUL_INT8)
+static void ggml_compute_forward_mul_mat_one_chunk_q3_K_4x4(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst,
+        const int64_t ir0_start,
+        const int64_t ir0_end,
+        const int64_t ir1_start,
+        const int64_t ir1_end) {
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    GGML_ASSERT(src0->type == GGML_TYPE_Q3_K);
+    GGML_ASSERT((ir0_end - ir0_start) % 4 == 0);
+    GGML_ASSERT((ir1_end - ir1_start) % 4 == 0);
+
+    const bool src1_cont = ggml_is_contiguous(src1);
+    const enum ggml_type vec_dot_type = GGML_TYPE_Q8_K;
+
+    const int64_t r2 = ne12 / ne02;
+    const int64_t r3 = ne13 / ne03;
+
+    if (ir0_start >= ir0_end || ir1_start >= ir1_end) {
+        return;
+    }
+
+    const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+    const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+
+    GGML_ASSERT(ne12 % ne02 == 0);
+    GGML_ASSERT(ne13 % ne03 == 0);
+
+    const int64_t blck_0 = 16;
+    const int64_t blck_1 = 16;
+    const size_t src1_col_stride = src1_cont || src1->type != vec_dot_type ? row_size : nb11;
+
+    float tmp[64];
+
+    for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
+        for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
+            for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ir1 += 4) {
+                const int64_t i13 = ir1 / (ne12 * ne1);
+                const int64_t i12 = (ir1 - i13 * ne12 * ne1) / ne1;
+                const int64_t i11 = ir1 - i13 * ne12 * ne1 - i12 * ne1;
+
+                const int64_t i03 = i13 / r3;
+                const int64_t i02 = i12 / r2;
+
+                const char * src0_row = (const char *) src0->data + i02 * nb02 + i03 * nb03;
+                const char * src1_col = (const char *) wdata +
+                    (src1_cont || src1->type != vec_dot_type
+                        ? (i11 + i12 * ne11 + i13 * ne12 * ne11) * row_size
+                        : (i11 * nb11 + i12 * nb12 + i13 * nb13));
+                float * dst_col = (float *) ((char *) dst->data + i11 * nb1 + i12 * nb2 + i13 * nb3);
+
+                for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ir0 += 4) {
+                    ggml_vec_dot_q3_K_q8_K_4x4(
+                            ne00, &tmp[ir0 - iir0], 16,
+                            src0_row + ir0 * nb01, nb01,
+                            src1_col, src1_col_stride);
+                }
+
+                for (int cn = 0; cn < 4; ++cn) {
+                    memcpy(&dst_col[iir0 + cn * nb1 / nb0], tmp + cn * 16,
+                            (MIN(iir0 + blck_0, ir0_end) - iir0) * sizeof(float));
+                }
+            }
+        }
+    }
+}
+
+static void ggml_compute_forward_mul_mat_one_chunk_q3_K_4x8(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst,
+        const int64_t ir0_start,
+        const int64_t ir0_end,
+        const int64_t ir1_start,
+        const int64_t ir1_end) {
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    GGML_ASSERT(src0->type == GGML_TYPE_Q3_K);
+    GGML_ASSERT((ir0_end - ir0_start) % 4 == 0);
+    GGML_ASSERT((ir1_end - ir1_start) % 8 == 0);
+
+    const bool src1_cont = ggml_is_contiguous(src1);
+    const enum ggml_type vec_dot_type = GGML_TYPE_Q8_K;
+
+    const int64_t r2 = ne12 / ne02;
+    const int64_t r3 = ne13 / ne03;
+
+    if (ir0_start >= ir0_end || ir1_start >= ir1_end) {
+        return;
+    }
+
+    const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+    const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+
+    GGML_ASSERT(ne12 % ne02 == 0);
+    GGML_ASSERT(ne13 % ne03 == 0);
+
+    const int64_t blck_0 = 16;
+    const int64_t blck_1 = 16;
+    const size_t src1_col_stride = src1_cont || src1->type != vec_dot_type ? row_size : nb11;
+
+    float tmp[128];
+
+    for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
+        for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
+            for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ir1 += 8) {
+                const int64_t i13 = ir1 / (ne12 * ne1);
+                const int64_t i12 = (ir1 - i13 * ne12 * ne1) / ne1;
+                const int64_t i11 = ir1 - i13 * ne12 * ne1 - i12 * ne1;
+
+                const int64_t i03 = i13 / r3;
+                const int64_t i02 = i12 / r2;
+
+                const char * src0_row = (const char *) src0->data + i02 * nb02 + i03 * nb03;
+                const char * src1_col = (const char *) wdata +
+                    (src1_cont || src1->type != vec_dot_type
+                        ? (i11 + i12 * ne11 + i13 * ne12 * ne11) * row_size
+                        : (i11 * nb11 + i12 * nb12 + i13 * nb13));
+                float * dst_col = (float *) ((char *) dst->data + i11 * nb1 + i12 * nb2 + i13 * nb3);
+
+                for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ir0 += 4) {
+                    ggml_vec_dot_q3_K_q8_K_4x8(
+                            ne00, &tmp[ir0 - iir0], 16,
+                            src0_row + ir0 * nb01, nb01,
+                            src1_col, src1_col_stride);
+                }
+
+                for (int cn = 0; cn < 8; ++cn) {
+                    memcpy(&dst_col[iir0 + cn * nb1 / nb0], tmp + cn * 16,
+                            (MIN(iir0 + blck_0, ir0_end) - iir0) * sizeof(float));
+                }
+            }
+        }
+    }
+}
+
+__attribute__((noinline))
+static void ggml_compute_forward_mul_mat_q3_K_4x4_chunk(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst,
+        const int64_t ir0_start,
+        const int64_t ir0_end,
+        const int64_t ir1_start,
+        const int64_t ir1_end) {
+    const struct ggml_tensor * src1 = dst->src[1];
+    const int64_t ne11 = src1->ne[1];
+    const int64_t ir0_quad_end = ir0_start + (ir0_end - ir0_start) / 4 * 4;
+    const int64_t ir0_pair_end = ir0_quad_end + (ir0_end - ir0_quad_end) / 2 * 2;
+
+    for (int64_t ir1_segment_start = ir1_start; ir1_segment_start < ir1_end;) {
+        const int64_t ir1_dim1_end = (ir1_segment_start / ne11 + 1) * ne11;
+        const int64_t ir1_segment_end = MIN(ir1_end, ir1_dim1_end);
+        const int64_t ir1_oct_end = ir1_segment_start + (ir1_segment_end - ir1_segment_start) / 8 * 8;
+        const int64_t ir1_quad_end = ir1_segment_start + (ir1_segment_end - ir1_segment_start) / 4 * 4;
+        const int64_t ir1_pair_end = ir1_quad_end + (ir1_segment_end - ir1_quad_end) / 2 * 2;
+
+        if (ir0_start < ir0_quad_end && ir1_segment_start < ir1_oct_end) {
+            ggml_compute_forward_mul_mat_one_chunk_q3_K_4x8(
+                    params, dst, ir0_start, ir0_quad_end, ir1_segment_start, ir1_oct_end);
+        }
+        if (ir0_start < ir0_quad_end && ir1_oct_end < ir1_quad_end) {
+            ggml_compute_forward_mul_mat_one_chunk_q3_K_4x4(
+                    params, dst, ir0_start, ir0_quad_end, ir1_oct_end, ir1_quad_end);
+        }
+        if (ir0_start < ir0_quad_end && ir1_quad_end < ir1_pair_end) {
+            ggml_compute_forward_mul_mat_one_chunk(
+                    params, dst, GGML_TYPE_Q3_K, 2,
+                    ir0_start, ir0_quad_end, ir1_quad_end, ir1_pair_end);
+        }
+        if (ir0_start < ir0_quad_end && ir1_pair_end < ir1_segment_end) {
+            ggml_compute_forward_mul_mat_one_chunk(
+                    params, dst, GGML_TYPE_Q3_K, 1,
+                    ir0_start, ir0_quad_end, ir1_pair_end, ir1_segment_end);
+        }
+        if (ir0_quad_end < ir0_pair_end && ir1_segment_start < ir1_pair_end) {
+            ggml_compute_forward_mul_mat_one_chunk(
+                    params, dst, GGML_TYPE_Q3_K, 2,
+                    ir0_quad_end, ir0_pair_end, ir1_segment_start, ir1_pair_end);
+        }
+        if (ir0_quad_end < ir0_pair_end && ir1_pair_end < ir1_segment_end) {
+            ggml_compute_forward_mul_mat_one_chunk(
+                    params, dst, GGML_TYPE_Q3_K, 1,
+                    ir0_quad_end, ir0_pair_end, ir1_pair_end, ir1_segment_end);
+        }
+        if (ir0_pair_end < ir0_end) {
+            ggml_compute_forward_mul_mat_one_chunk(
+                    params, dst, GGML_TYPE_Q3_K, 1,
+                    ir0_pair_end, ir0_end, ir1_segment_start, ir1_segment_end);
+        }
+
+        ir1_segment_start = ir1_segment_end;
+    }
+}
+#endif
+
 void ggml_compute_forward_mul_mat(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -1433,15 +1639,41 @@ UseGgmlGemm2:;
         const int64_t ir1_start = dr1 * ith1;
         const int64_t ir1_end = MIN(ir1_start + dr1, nr1);
 
-        // dot kernels can handle 1 row and col at a time, but mmla kernels can process 2 rows and cols
-        int64_t num_rows_per_vec_dot = vec_dot_num_rows;
+#if defined (__ARM_FEATURE_MATMUL_INT8)
+        if (src0->type == GGML_TYPE_Q3_K && ne11 >= 4 && ir0_end - ir0_start >= 4) {
+            ggml_compute_forward_mul_mat_q3_K_4x4_chunk(
+                    params, dst, ir0_start, ir0_end, ir1_start, ir1_end);
+        } else
+#endif
+        {
+            GGML_ASSERT(vec_dot_num_rows == 1 || vec_dot_num_rows == 2);
+            if (vec_dot_num_rows == 1) {
+                ggml_compute_forward_mul_mat_one_chunk(params, dst, src0->type, 1, ir0_start, ir0_end, ir1_start, ir1_end);
+            } else {
+                const int64_t ir0_pair_end = ir0_start + (ir0_end - ir0_start) / 2 * 2;
 
-        // these checks are needed to avoid crossing dim1 boundaries
-        // can be optimized, but the logic would become more complicated, so keeping it like this for simplicity
-        if ((nr0 % 2 != 0) || (ne11 % 2 != 0) || ((ir0_end - ir0_start) % 2 != 0) || ((ir1_end - ir1_start) % 2 != 0)) {
-            num_rows_per_vec_dot = 1;
+                for (int64_t ir1_segment_start = ir1_start; ir1_segment_start < ir1_end;) {
+                    const int64_t ir1_dim1_end = (ir1_segment_start / ne11 + 1) * ne11;
+                    const int64_t ir1_segment_end = MIN(ir1_end, ir1_dim1_end);
+                    const int64_t ir1_pair_end = ir1_segment_start + (ir1_segment_end - ir1_segment_start) / 2 * 2;
+
+                    if (ir0_start < ir0_pair_end && ir1_segment_start < ir1_pair_end) {
+                        ggml_compute_forward_mul_mat_one_chunk(params, dst, src0->type, 2,
+                                ir0_start, ir0_pair_end, ir1_segment_start, ir1_pair_end);
+                    }
+                    if (ir0_pair_end < ir0_end && ir1_segment_start < ir1_pair_end) {
+                        ggml_compute_forward_mul_mat_one_chunk(params, dst, src0->type, 1,
+                                ir0_pair_end, ir0_end, ir1_segment_start, ir1_pair_end);
+                    }
+                    if (ir1_pair_end < ir1_segment_end) {
+                        ggml_compute_forward_mul_mat_one_chunk(params, dst, src0->type, 1,
+                                ir0_start, ir0_end, ir1_pair_end, ir1_segment_end);
+                    }
+
+                    ir1_segment_start = ir1_segment_end;
+                }
+            }
         }
-        ggml_compute_forward_mul_mat_one_chunk(params, dst, src0->type, num_rows_per_vec_dot, ir0_start, ir0_end, ir1_start, ir1_end);
 
         if (nth >= nchunk0 * nchunk1) {
             break;
