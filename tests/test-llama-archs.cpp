@@ -11,6 +11,7 @@
 
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
+#include "../src/llama-context.h"
 #include "../src/llama-kv-cache.h"
 #include "../src/llama-model-saver.h"
 
@@ -332,11 +333,11 @@ static std::vector<float> get_logits(
 }
 
 static double test_d2f_prefix_cache(llama_model * model, const std::vector<llama_token> & tokens) {
-    static const std::vector<llama_pos> positions = { 0, 0, 1, 1, 2, 3, 4, 5, 6, 7 };
-    static constexpr int32_t image_prefix_length = 4;
-    static constexpr int32_t prefix_length = 6;
-    static constexpr int32_t prompt_position = 2;
-    static constexpr int32_t generation_position = 4;
+    static const std::vector<llama_pos> positions = { 0, 1, 1, 2, 2, 2, 3, 4, 5, 6, 7, 8 };
+    static constexpr int32_t image_prefix_length = 6;
+    static constexpr int32_t prefix_length = 8;
+    static constexpr int32_t prompt_position = 3;
+    static constexpr int32_t generation_position = 5;
     static constexpr int32_t block_size = 2;
     static constexpr int32_t generation_length = 4;
 
@@ -421,7 +422,7 @@ static double test_d2f_prefix_cache(llama_model * model, const std::vector<llama
     std::vector<float> logits_component_parallel;
     logits_component_parallel.reserve(generation_length*n_vocab);
     {
-        llama_context_ptr context = make_context(4);
+        llama_context_ptr context = make_context(image_prefix_length);
         llama_batch image = llama_batch_init(image_prefix_length, 0, 1);
         for (int32_t i = 0; i < image_prefix_length; ++i) {
             common_batch_add(image, tokens[i], positions[i], { 0 }, i == image_prefix_length - 1);
@@ -460,6 +461,380 @@ static double test_d2f_prefix_cache(llama_model * model, const std::vector<llama
         llama_batch_free(generation);
     }
 
+    const int32_t packed_test_n_embd = llama_model_n_embd_inp(model);
+    static const std::vector<llama_pos> packed_test_positions = { 0, 1, 1, 2, 2, 2 };
+    static constexpr int32_t packed_test_streams = 3;
+    static constexpr int32_t packed_test_offsets[packed_test_streams] = { 0, 1, 3 };
+    static constexpr int32_t packed_test_lengths[packed_test_streams] = { 1, 2, 3 };
+    std::vector<float> packed_test_image_embeddings(
+            static_cast<size_t>(image_prefix_length)*packed_test_n_embd);
+    for (int32_t token = 0; token < image_prefix_length; ++token) {
+        for (int32_t dim = 0; dim < packed_test_n_embd; ++dim) {
+            packed_test_image_embeddings[static_cast<size_t>(token)*packed_test_n_embd + dim] =
+                    static_cast<float>((tokens[token] + 3*dim + token) % 29)/29.0f;
+        }
+    }
+
+    {
+        llama_context_params params = llama_context_default_params();
+        params.n_ctx = 16;
+        params.n_batch = image_prefix_length;
+        params.n_ubatch = image_prefix_length;
+        params.n_outputs_max = generation_length;
+        params.n_seq_max = packed_test_streams;
+        params.kv_unified = true;
+        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        params.no_perf = true;
+        llama_context_ptr context(llama_init_from_model(model, params));
+        if (!context) {
+            throw std::runtime_error("failed to create non-Flash D2F packed contract context");
+        }
+
+        // Clearing is always valid, including on a context without Flash Attention.
+        llama_set_d2f_packed_prefill(context.get(), 0, 0, 0);
+        bool rejected = false;
+        try {
+            llama_set_d2f_packed_prefill(
+                    context.get(),
+                    packed_test_streams,
+                    image_prefix_length,
+                    3);
+        } catch (const std::invalid_argument &) {
+            rejected = true;
+        }
+        if (!rejected) {
+            throw std::runtime_error("packed D2F prefill accepted a context without Flash Attention");
+        }
+    }
+
+    std::vector<float> logits_packed_reference;
+    logits_packed_reference.reserve(generation_length*n_vocab);
+    {
+        llama_context_ptr context = make_context(image_prefix_length);
+        for (int32_t stream = 0; stream < packed_test_streams; ++stream) {
+            const int32_t offset = packed_test_offsets[stream];
+            const int32_t length = packed_test_lengths[stream];
+            llama_batch image = llama_batch_init(length, packed_test_n_embd, 1);
+            image.n_tokens = length;
+            for (int32_t i = 0; i < length; ++i) {
+                const int32_t source = offset + i;
+                std::copy_n(
+                        packed_test_image_embeddings.data() + static_cast<size_t>(source)*packed_test_n_embd,
+                        packed_test_n_embd,
+                        image.embd + static_cast<size_t>(i)*packed_test_n_embd);
+                image.pos[i] = packed_test_positions[source];
+                image.n_seq_id[i] = 1;
+                image.seq_id[i][0] = 0;
+                image.logits[i] = i == length - 1;
+            }
+            if (llama_decode(context.get(), image) != 0) {
+                llama_batch_free(image);
+                throw std::runtime_error("D2F component-exact image decode failed");
+            }
+            llama_batch_free(image);
+        }
+
+        const int32_t prompt_length = prefix_length - image_prefix_length;
+        llama_batch prompt = llama_batch_init(prompt_length, 0, 1);
+        for (int32_t i = 0; i < prompt_length; ++i) {
+            const int32_t source = image_prefix_length + i;
+            common_batch_add(prompt, tokens[source], positions[source], { 0 }, i == prompt_length - 1);
+        }
+        if (llama_decode(context.get(), prompt) != 0) {
+            llama_batch_free(prompt);
+            throw std::runtime_error("D2F packed-lane reference prompt decode failed");
+        }
+        llama_batch_free(prompt);
+
+        llama_batch generation = llama_batch_init(generation_length, 0, 1);
+        for (int32_t i = 0; i < generation_length; ++i) {
+            const int32_t source = prefix_length + i;
+            common_batch_add(generation, tokens[source], positions[source], { 0 }, true);
+        }
+        if (llama_decode(context.get(), generation) != 0) {
+            llama_batch_free(generation);
+            throw std::runtime_error("D2F packed-lane reference generation decode failed");
+        }
+        for (int32_t i = 0; i < generation_length; ++i) {
+            const float * row = llama_get_logits_ith(context.get(), i);
+            logits_packed_reference.insert(logits_packed_reference.end(), row, row + n_vocab);
+        }
+        llama_batch_free(generation);
+    }
+
+    std::vector<float> logits_packed_lanes;
+    logits_packed_lanes.reserve(generation_length*n_vocab);
+    {
+        static constexpr int32_t packed_tokens = image_prefix_length;
+
+        llama_context_params params = llama_context_default_params();
+        params.n_ctx = 16;
+        params.n_batch = packed_tokens;
+        params.n_ubatch = packed_tokens;
+        params.n_outputs_max = generation_length;
+        params.n_seq_max = 4;
+        params.kv_unified = true;
+        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        params.no_perf = true;
+        llama_context_ptr context(llama_init_from_model(model, params));
+        if (!context) {
+            throw std::runtime_error("failed to create D2F packed-lane context");
+        }
+        if (llama_context_d2f_parallel_activation_count(context.get()) != 0) {
+            throw std::runtime_error("CPU context reported a CUDA D2F parallel activation");
+        }
+        if (context->d2f_packed_prefill_stream_capacity_max() != 0) {
+            throw std::runtime_error("packed stream capacity was nonzero at context initialization");
+        }
+        llama_set_causal_attn(context.get(), false);
+        llama_set_d2f_attention(
+                context.get(),
+                image_prefix_length,
+                prefix_length,
+                prompt_position,
+                generation_position,
+                block_size);
+        llama_set_d2f_packed_prefill(context.get(), packed_test_streams, packed_tokens, 3);
+        if (context->d2f_packed_prefill_stream_capacity_max() != packed_test_streams) {
+            throw std::runtime_error("packed stream capacity did not record its first high-water mark");
+        }
+        llama_set_d2f_packed_prefill(context.get(), 0, 0, 0);
+        if (context->d2f_packed_prefill_stream_capacity_max() != packed_test_streams) {
+            throw std::runtime_error("clearing packed prefill lowered its stream capacity");
+        }
+        llama_set_d2f_packed_prefill(context.get(), 2, packed_tokens, 3);
+        if (context->d2f_packed_prefill_stream_capacity_max() != packed_test_streams) {
+            throw std::runtime_error("a smaller packed request changed the stream capacity");
+        }
+        llama_set_d2f_packed_prefill(context.get(), 0, 0, 0);
+        llama_set_d2f_packed_prefill(context.get(), 4, packed_tokens, 3);
+        if (context->d2f_packed_prefill_stream_capacity_max() != 4) {
+            throw std::runtime_error("a larger packed request did not raise the stream capacity");
+        }
+        llama_set_d2f_packed_prefill(context.get(), 0, 0, 0);
+        llama_set_d2f_packed_prefill(context.get(), packed_test_streams, packed_tokens, 3);
+
+        llama_batch invalid_image = llama_batch_init(packed_tokens, packed_test_n_embd, 1);
+        invalid_image.n_tokens = packed_tokens;
+        for (int32_t packed_index = 0; packed_index < packed_tokens; ++packed_index) {
+            std::copy_n(
+                    packed_test_image_embeddings.data() +
+                            static_cast<size_t>(packed_index)*packed_test_n_embd,
+                    packed_test_n_embd,
+                    invalid_image.embd + static_cast<size_t>(packed_index)*packed_test_n_embd);
+            invalid_image.pos[packed_index] = packed_test_positions[packed_index];
+            invalid_image.n_seq_id[packed_index] = 1;
+            invalid_image.seq_id[packed_index][0] = packed_index < packed_test_offsets[1] ? 0 : 1;
+            invalid_image.logits[packed_index] = packed_index == packed_tokens - 1;
+        }
+        if (llama_decode(context.get(), invalid_image) == 0) {
+            llama_batch_free(invalid_image);
+            throw std::runtime_error("D2F packed-lane layout mismatch fell back to dense attention");
+        }
+        llama_batch_free(invalid_image);
+
+        llama_batch image = llama_batch_init(packed_tokens, packed_test_n_embd, 1);
+        image.n_tokens = packed_tokens;
+        for (int32_t packed_index = 0; packed_index < packed_tokens; ++packed_index) {
+            std::copy_n(
+                    packed_test_image_embeddings.data() +
+                            static_cast<size_t>(packed_index)*packed_test_n_embd,
+                    packed_test_n_embd,
+                    image.embd + static_cast<size_t>(packed_index)*packed_test_n_embd);
+            image.pos[packed_index] = packed_test_positions[packed_index];
+            image.n_seq_id[packed_index] = 1;
+            image.seq_id[packed_index][0] = packed_index < packed_test_offsets[1]
+                    ? 0
+                    : packed_index < packed_test_offsets[2] ? 1 : 2;
+            image.logits[packed_index] = packed_index == packed_tokens - 1;
+        }
+        if (llama_decode(context.get(), image) != 0) {
+            llama_batch_free(image);
+            throw std::runtime_error("D2F packed-lane image decode failed");
+        }
+        if (llama_context_d2f_parallel_activation_count(context.get()) != 0) {
+            llama_batch_free(image);
+            throw std::runtime_error("CPU packed decode reported hardware parallel activation");
+        }
+        llama_batch_free(image);
+        llama_set_d2f_packed_prefill(context.get(), 0, 0, 0);
+        for (int32_t stream = 1; stream < packed_test_streams; ++stream) {
+            const llama_pos image_position = packed_test_positions[packed_test_offsets[stream]];
+            llama_memory_seq_cp(
+                    llama_get_memory(context.get()),
+                    stream,
+                    0,
+                    image_position,
+                    image_position + 1);
+            if (!llama_memory_seq_rm(
+                        llama_get_memory(context.get()),
+                        stream,
+                        image_position,
+                        image_position + 1)) {
+                throw std::runtime_error("D2F packed-lane sequence merge failed");
+            }
+        }
+
+        const int32_t prompt_length = prefix_length - image_prefix_length;
+        llama_batch prompt = llama_batch_init(prompt_length, 0, 1);
+        for (int32_t i = 0; i < prompt_length; ++i) {
+            const int32_t source = image_prefix_length + i;
+            common_batch_add(prompt, tokens[source], positions[source], { 0 }, i == prompt_length - 1);
+        }
+        if (llama_decode(context.get(), prompt) != 0) {
+            llama_batch_free(prompt);
+            throw std::runtime_error("D2F packed-lane prompt decode failed");
+        }
+        llama_batch_free(prompt);
+
+        llama_batch generation = llama_batch_init(generation_length, 0, 1);
+        for (int32_t i = 0; i < generation_length; ++i) {
+            const int32_t source = prefix_length + i;
+            common_batch_add(generation, tokens[source], positions[source], { 0 }, true);
+        }
+        if (llama_decode(context.get(), generation) != 0) {
+            llama_batch_free(generation);
+            throw std::runtime_error("D2F packed-lane generation decode failed");
+        }
+        for (int32_t i = 0; i < generation_length; ++i) {
+            const float * row = llama_get_logits_ith(context.get(), i);
+            logits_packed_lanes.insert(logits_packed_lanes.end(), row, row + n_vocab);
+        }
+        llama_batch_free(generation);
+    }
+
+    for (int32_t i = 0; i < generation_length; ++i) {
+        const auto reference_begin = logits_packed_reference.begin() + static_cast<size_t>(i)*n_vocab;
+        const auto packed_begin = logits_packed_lanes.begin() + static_cast<size_t>(i)*n_vocab;
+        if (std::max_element(reference_begin, reference_begin + n_vocab) - reference_begin !=
+            std::max_element(packed_begin, packed_begin + n_vocab) - packed_begin) {
+            throw std::runtime_error("D2F packed-lane output token mismatch");
+        }
+    }
+
+    const auto run_quantized_packed_arm = [&](bool packed) {
+        static constexpr int32_t packed_tokens = image_prefix_length;
+
+        llama_context_params params = llama_context_default_params();
+        params.n_ctx = 16;
+        params.n_batch = packed_tokens;
+        params.n_ubatch = packed_tokens;
+        params.n_outputs_max = generation_length;
+        params.n_seq_max = packed ? packed_test_streams : 1;
+        params.kv_unified = true;
+        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        params.type_k = GGML_TYPE_Q8_0;
+        params.type_v = GGML_TYPE_Q8_0;
+        params.no_perf = true;
+        llama_context_ptr context(llama_init_from_model(model, params));
+        if (!context) {
+            throw std::runtime_error("failed to create D2F Q8_0 packed-lane context");
+        }
+        auto * cache = dynamic_cast<llama_kv_cache *>(llama_get_memory(context.get()));
+        if (!cache || cache->type_k() != GGML_TYPE_Q8_0 || cache->type_v() != GGML_TYPE_Q8_0) {
+            throw std::runtime_error("D2F Q8_0 packed-lane context did not retain quantized K/V");
+        }
+        llama_set_causal_attn(context.get(), false);
+        llama_set_d2f_attention(
+                context.get(),
+                image_prefix_length,
+                prefix_length,
+                prompt_position,
+                generation_position,
+                block_size);
+        if (packed) {
+            llama_set_d2f_packed_prefill(context.get(), packed_test_streams, packed_tokens, 3);
+        }
+
+        const int32_t image_decodes = packed ? 1 : packed_test_streams;
+        for (int32_t decode_index = 0; decode_index < image_decodes; ++decode_index) {
+            const int32_t offset = packed ? 0 : packed_test_offsets[decode_index];
+            const int32_t length = packed ? packed_tokens : packed_test_lengths[decode_index];
+            llama_batch image = llama_batch_init(length, packed_test_n_embd, 1);
+            image.n_tokens = length;
+            for (int32_t i = 0; i < length; ++i) {
+                const int32_t source = offset + i;
+                std::copy_n(
+                        packed_test_image_embeddings.data() + static_cast<size_t>(source)*packed_test_n_embd,
+                        packed_test_n_embd,
+                        image.embd + static_cast<size_t>(i)*packed_test_n_embd);
+                image.pos[i] = packed_test_positions[source];
+                image.n_seq_id[i] = 1;
+                image.seq_id[i][0] = !packed
+                        ? 0
+                        : source < packed_test_offsets[1] ? 0 : source < packed_test_offsets[2] ? 1 : 2;
+                image.logits[i] = i == length - 1;
+            }
+            if (llama_decode(context.get(), image) != 0) {
+                llama_batch_free(image);
+                throw std::runtime_error("D2F Q8_0 packed-lane image decode failed");
+            }
+            llama_batch_free(image);
+        }
+
+        if (packed) {
+            llama_set_d2f_packed_prefill(context.get(), 0, 0, 0);
+            for (int32_t stream = 1; stream < packed_test_streams; ++stream) {
+                const llama_pos image_position = packed_test_positions[packed_test_offsets[stream]];
+                llama_memory_seq_cp(
+                        llama_get_memory(context.get()),
+                        stream,
+                        0,
+                        image_position,
+                        image_position + 1);
+                if (!llama_memory_seq_rm(
+                            llama_get_memory(context.get()),
+                            stream,
+                            image_position,
+                            image_position + 1)) {
+                    throw std::runtime_error("D2F Q8_0 packed-lane sequence merge failed");
+                }
+            }
+        }
+
+        const int32_t prompt_length = prefix_length - image_prefix_length;
+        llama_batch prompt = llama_batch_init(prompt_length, 0, 1);
+        for (int32_t i = 0; i < prompt_length; ++i) {
+            const int32_t source = image_prefix_length + i;
+            common_batch_add(prompt, tokens[source], positions[source], { 0 }, i == prompt_length - 1);
+        }
+        if (llama_decode(context.get(), prompt) != 0) {
+            llama_batch_free(prompt);
+            throw std::runtime_error("D2F Q8_0 packed-lane prompt decode failed");
+        }
+        llama_batch_free(prompt);
+
+        llama_batch generation = llama_batch_init(generation_length, 0, 1);
+        for (int32_t i = 0; i < generation_length; ++i) {
+            const int32_t source = prefix_length + i;
+            common_batch_add(generation, tokens[source], positions[source], { 0 }, true);
+        }
+        if (llama_decode(context.get(), generation) != 0) {
+            llama_batch_free(generation);
+            throw std::runtime_error("D2F Q8_0 packed-lane generation decode failed");
+        }
+        std::vector<float> result;
+        result.reserve(generation_length*n_vocab);
+        for (int32_t i = 0; i < generation_length; ++i) {
+            const float * row = llama_get_logits_ith(context.get(), i);
+            result.insert(result.end(), row, row + n_vocab);
+        }
+        llama_batch_free(generation);
+        return result;
+    };
+
+    const std::vector<float> logits_packed_q8_reference = run_quantized_packed_arm(false);
+    const std::vector<float> logits_packed_q8_lanes = run_quantized_packed_arm(true);
+    for (int32_t i = 0; i < generation_length; ++i) {
+        const auto reference_begin = logits_packed_q8_reference.begin() + static_cast<size_t>(i)*n_vocab;
+        const auto packed_begin = logits_packed_q8_lanes.begin() + static_cast<size_t>(i)*n_vocab;
+        if (std::max_element(reference_begin, reference_begin + n_vocab) - reference_begin !=
+            std::max_element(packed_begin, packed_begin + n_vocab) - packed_begin) {
+            throw std::runtime_error("D2F Q8_0 packed-lane output token mismatch");
+        }
+    }
+    const double packed_q8_nmse = nmse(logits_packed_q8_reference, logits_packed_q8_lanes);
+
     for (int32_t i = 0; i < generation_length; ++i) {
         const auto cached_begin = logits_cached.begin() + static_cast<size_t>(i)*n_vocab;
         const auto component_begin = logits_component_parallel.begin() + static_cast<size_t>(i)*n_vocab;
@@ -488,7 +863,7 @@ static double test_d2f_prefix_cache(llama_model * model, const std::vector<llama
         }
         llama_batch_free(exact_prefix);
 
-        llama_context_ptr component_parallel_context = make_context(4);
+        llama_context_ptr component_parallel_context = make_context(image_prefix_length);
         llama_batch image = llama_batch_init(image_prefix_length, 0, 1);
         for (int32_t i = 0; i < image_prefix_length; ++i) {
             common_batch_add(
@@ -744,18 +1119,24 @@ static double test_d2f_prefix_cache(llama_model * model, const std::vector<llama
 
     const double full_cache_nmse = nmse(logits_full, logits_cached);
     const double component_parallel_nmse = nmse(logits_cached, logits_component_parallel);
+    const double packed_lanes_nmse = nmse(logits_packed_reference, logits_packed_lanes);
     const double transferred_nmse = nmse(logits_cached, logits_transferred);
     std::fprintf(
             stderr,
             "D2F prefix equivalence: full_cache_nmse=%.9e component_parallel_nmse=%.9e "
-            "scheduler_nmse=%.9e transferred_nmse=%.9e output_tokens=match\n",
+            "packed_lanes_nmse=%.9e packed_q8_nmse=%.9e scheduler_nmse=%.9e "
+            "transferred_nmse=%.9e output_tokens=match\n",
             full_cache_nmse,
             component_parallel_nmse,
+            packed_lanes_nmse,
+            packed_q8_nmse,
             scheduler_nmse,
             transferred_nmse);
     return std::max({
             full_cache_nmse,
             component_parallel_nmse,
+            packed_lanes_nmse,
+            packed_q8_nmse,
             transferred_nmse,
             scheduler_nmse,
     });

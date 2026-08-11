@@ -331,7 +331,7 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
-        // Keep the booleans together to avoid misalignment during copy-by-value.
+        // Keep the booleans together and at the end of the struct to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool check_tensors;   // validate model tensor data
         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
@@ -384,7 +384,7 @@ extern "C" {
         ggml_abort_callback abort_callback;
         void *              abort_callback_data;
 
-        // Keep the booleans together and at the end of the struct to avoid misalignment during copy-by-value.
+        // Keep the booleans together to avoid misalignment during copy-by-value.
         bool embeddings;  // if true, extract embeddings (together with logits)
         bool offload_kqv; // offload the KQV ops (including the KV cache) to GPU
         bool no_perf;     // measure performance timings
@@ -557,6 +557,11 @@ extern "C" {
     LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_rs_seq   (const struct llama_context * ctx);
     LLAMA_API enum llama_flash_attn_type llama_context_flash_attn_type(
+            const struct llama_context * ctx);
+    // Cumulative number of backend graph computes that activated validated
+    // D2F packed-attention parallel regions. Portable backends return zero.
+    // Compare values immediately before and after one packed decode.
+    LLAMA_API uint64_t llama_context_d2f_parallel_activation_count(
             const struct llama_context * ctx);
 
     DEPRECATED(LLAMA_API int32_t llama_n_ctx_train(const struct llama_model * model), "use llama_model_n_ctx_train instead");
@@ -1023,6 +1028,24 @@ extern "C" {
             int32_t prompt_position,
             int32_t generation_position,
             int32_t block_size);
+
+    // Configure a single packed D2F image-prefill submission. Packed mode is
+    // always disabled at context construction and is enabled only by this
+    // request-local setter. The batch must contain `tokens` real image tokens
+    // grouped into `streams` contiguous
+    // ragged lanes. The graph evaluates exact-sized independent attention
+    // branches and joins their real-token outputs; KV storage remains compact.
+    // `lane_tokens` records the largest lane for validation and diagnostics.
+    // This is supported only by LLaDA/LLaDA-MoE with unified KV and resolved
+    // Flash Attention. The following llama_decode() must match the declared
+    // token count and contain exactly one contiguous sequence-ID run numbered
+    // 0..streams-1 for each lane. A mismatched layout fails instead of falling
+    // back to dense attention. Pass three zeros to disable the packed view.
+    LLAMA_API void llama_set_d2f_packed_prefill(
+            struct llama_context * ctx,
+            int32_t streams,
+            int32_t tokens,
+            int32_t lane_tokens);
 
     // Set whether the model is in warmup mode or not
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.

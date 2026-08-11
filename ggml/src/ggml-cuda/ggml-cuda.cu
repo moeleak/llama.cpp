@@ -86,6 +86,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -3866,8 +3867,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
-static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
+static bool ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
+    bool d2f_parallel_launched = false;
 
     // flag used to determine whether it is an integrated_gpu
     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
@@ -3877,9 +3879,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     ggml_cuda_concurrent_event * concurrent_event           = nullptr;
     bool                         should_launch_concurrent_events = false;
 
-    const auto try_launch_concurrent_event = [&](const ggml_tensor * node) {
-        if (stream_ctx.concurrent_events.find(node) != stream_ctx.concurrent_events.end()) {
-            concurrent_event = &stream_ctx.concurrent_events[node];
+    const auto try_launch_concurrent_event = [&](const ggml_tensor * node, bool before_node = false) {
+        const auto event_it = stream_ctx.concurrent_events.find(node);
+        if (event_it != stream_ctx.concurrent_events.end() &&
+            event_it->second.launch_before_fork == before_node) {
+            concurrent_event = &event_it->second;
 
             is_concurrent_event_active = true;
 
@@ -3893,6 +3897,33 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 cudaStream_t stream = cuda_ctx->stream(cuda_ctx->device, i);
                 CUDA_CHECK(cudaStreamWaitEvent(stream, concurrent_event->fork_event));
             }
+
+            if (concurrent_event->d2f_packed_attention &&
+                !stream_ctx.d2f_activation_summary_logged) {
+                int regions = 0;
+                int domains_min = std::numeric_limits<int>::max();
+                int domains_max = 0;
+                int worker_streams_max = 0;
+                for (const auto & entry : stream_ctx.concurrent_events) {
+                    const ggml_cuda_concurrent_event & event = entry.second;
+                    if (!event.d2f_packed_attention) {
+                        continue;
+                    }
+                    ++regions;
+                    domains_min = std::min(domains_min, event.d2f_domains);
+                    domains_max = std::max(domains_max, event.d2f_domains);
+                    worker_streams_max = std::max(worker_streams_max, event.n_streams);
+                }
+                GGML_LOG_INFO(
+                        "D2F CUDA parallel Flash Attention activated: regions=%d "
+                        "domains_min=%d domains_max=%d worker_streams_max=%d\n",
+                        regions,
+                        domains_min,
+                        domains_max,
+                        worker_streams_max);
+                stream_ctx.d2f_activation_summary_logged = true;
+            }
+            d2f_parallel_launched = d2f_parallel_launched || concurrent_event->d2f_packed_attention;
         }
     };
 
@@ -3904,9 +3935,27 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             if (stream_ctx.concurrent_events.size() > 0) {
                 should_launch_concurrent_events = true;
+                int d2f_regions = 0;
+                int invalid_d2f_regions = 0;
                 for (const auto & [tensor, event] : stream_ctx.concurrent_events) {
-                    should_launch_concurrent_events = should_launch_concurrent_events && event.is_valid();
+                    const bool valid = event.is_valid();
+                    should_launch_concurrent_events = should_launch_concurrent_events && valid;
+                    if (event.d2f_packed_attention) {
+                        ++d2f_regions;
+                        invalid_d2f_regions += valid ? 0 : 1;
+                    }
                 }
+                if (invalid_d2f_regions > 0) {
+                    GGML_LOG_WARN(
+                            "D2F CUDA parallel Flash Attention not activated: "
+                            "invalid_regions=%d total_regions=%d "
+                            "reason=memory overlap or cross-stream dependency\n",
+                            invalid_d2f_regions,
+                            d2f_regions);
+                }
+                stream_ctx.d2f_events_validated = should_launch_concurrent_events && d2f_regions > 0;
+            } else {
+                stream_ctx.d2f_events_validated = false;
             }
 
             if (should_launch_concurrent_events) {
@@ -3966,6 +4015,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
+                if (!is_concurrent_event_active) {
+                    // Packed D2F uses its first FA node as a marker, so the
+                    // fork must happen before that node is submitted.
+                    try_launch_concurrent_event(node, true);
+                }
                 if (is_concurrent_event_active) {
                     GGML_ASSERT(concurrent_event);
 
@@ -4052,6 +4106,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
 
             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
+            graph->d2f_packed_attention = d2f_parallel_launched && stream_ctx.d2f_events_validated;
             graph_evaluated_or_captured = true; // CUDA graph has been captured
 
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
@@ -4073,11 +4128,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
         // Launch graph
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+        d2f_parallel_launched = d2f_parallel_launched || graph->d2f_packed_attention;
 #else
         GGML_UNUSED(graph_key);
         graph_evaluated_or_captured = true;
 #endif  // USE_CUDA_GRAPH
     }
+
+    return d2f_parallel_launched;
 }
 
 #ifdef USE_CUDA_GRAPH
@@ -4151,7 +4209,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
-    ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    const bool d2f_parallel_launched = ggml_cuda_graph_evaluate_and_capture(
+            cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    if (d2f_parallel_launched) {
+        cuda_ctx->d2f_parallel_activation_count.fetch_add(1, std::memory_order_relaxed);
+    }
 
     return GGML_STATUS_SUCCESS;
 }
@@ -4181,6 +4243,343 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
     }
 }
 
+struct ggml_cuda_d2f_packed_group {
+    const ggml_tensor * join = nullptr;
+    std::vector<std::pair<int, const ggml_tensor *>> lanes;
+    bool duplicate_join = false;
+};
+
+static bool ggml_cuda_parse_d2f_packed_lane_name(const char * name, int & layer, int & lane) {
+    int consumed = 0;
+    if (std::sscanf(name, "d2f_packed_attn_lane-%d-%d%n", &layer, &lane, &consumed) != 2 ||
+        consumed <= 0 || name[consumed] != '\0') {
+        return false;
+    }
+    return layer >= 0 && lane >= 0;
+}
+
+static bool ggml_cuda_parse_d2f_packed_join_name(const char * name, int & layer) {
+    int consumed = 0;
+    if (std::sscanf(name, "d2f_packed_attn_join-%d%n", &layer, &consumed) != 1 ||
+        consumed <= 0 || name[consumed] != '\0') {
+        return false;
+    }
+    return layer >= 0;
+}
+
+static bool ggml_cuda_trace_d2f_packed_lane(
+        const ggml_tensor * output,
+        const ggml_tensor *& flash_attn,
+        std::vector<const ggml_tensor *> & branch) {
+    std::vector<const ggml_tensor *> tail;
+    const ggml_tensor * node = output;
+    while (node != nullptr && node->op != GGML_OP_FLASH_ATTN_EXT) {
+        if (!ggml_cuda_is_view_or_noop(node) || node->src[0] == nullptr) {
+            return false;
+        }
+        tail.push_back(node);
+        node = node->src[0];
+    }
+    if (node == nullptr || node->op != GGML_OP_FLASH_ATTN_EXT || node->src[3] != nullptr) {
+        return false;
+    }
+
+    flash_attn = node;
+    branch.push_back(node);
+    for (auto it = tail.rbegin(); it != tail.rend(); ++it) {
+        branch.push_back(*it);
+    }
+    return true;
+}
+
+static bool ggml_cuda_collect_d2f_concat_tree(
+        const ggml_tensor * node,
+        const std::set<const ggml_tensor *> & lane_outputs,
+        std::set<const ggml_tensor *> & seen_lanes,
+        std::vector<const ggml_tensor *> & concat_postorder) {
+    if (lane_outputs.find(node) != lane_outputs.end()) {
+        return seen_lanes.insert(node).second;
+    }
+    if (node == nullptr || node->op != GGML_OP_CONCAT ||
+        ggml_get_op_params_i32(node, 0) != 1 ||
+        node->src[0] == nullptr || node->src[1] == nullptr) {
+        return false;
+    }
+    if (!ggml_cuda_collect_d2f_concat_tree(
+                node->src[0], lane_outputs, seen_lanes, concat_postorder) ||
+        !ggml_cuda_collect_d2f_concat_tree(
+                node->src[1], lane_outputs, seen_lanes, concat_postorder)) {
+        return false;
+    }
+    concat_postorder.push_back(node);
+    return true;
+}
+
+// Detect the explicit D2F packed-attention naming contract emitted by
+// llama-graph, then schedule the independent Flash Attention branches on CUDA
+// worker streams. The graph is reordered before allocation so every branch
+// output remains live until the concat tree executes on the main stream.
+//
+// This is intentionally fail-closed: an incomplete name set, a non-FA lane,
+// a masked FA, an unexpected consumer, or an invalid concat tree produces no
+// concurrent event and therefore cannot be reported as activated.
+static int ggml_cuda_optimize_d2f_packed_attention(
+        ggml_backend_cuda_context * cuda_ctx,
+        ggml_cgraph * cgraph) {
+    std::map<int, ggml_cuda_d2f_packed_group> groups;
+    std::unordered_map<const ggml_tensor *, int> node_indices;
+    node_indices.reserve(cgraph->n_nodes);
+
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        node_indices[node] = i;
+
+        int layer = -1;
+        int lane = -1;
+        if (ggml_cuda_parse_d2f_packed_lane_name(node->name, layer, lane)) {
+            groups[layer].lanes.emplace_back(lane, node);
+            continue;
+        }
+        if (ggml_cuda_parse_d2f_packed_join_name(node->name, layer)) {
+            ggml_cuda_d2f_packed_group & group = groups[layer];
+            if (group.join != nullptr) {
+                group.duplicate_join = true;
+            } else {
+                group.join = node;
+            }
+        }
+    }
+
+    std::vector<int> layers;
+    layers.reserve(groups.size());
+    for (const auto & entry : groups) {
+        layers.push_back(entry.first);
+    }
+    std::sort(layers.begin(), layers.end(), [&](int lhs, int rhs) {
+        const ggml_tensor * lhs_join = groups[lhs].join;
+        const ggml_tensor * rhs_join = groups[rhs].join;
+        const int lhs_index = lhs_join && node_indices.count(lhs_join) ? node_indices[lhs_join] : -1;
+        const int rhs_index = rhs_join && node_indices.count(rhs_join) ? node_indices[rhs_join] : -1;
+        return lhs_index > rhs_index;
+    });
+
+    int optimized_regions = 0;
+    int rejected_regions = 0;
+    int first_rejected_layer = -1;
+    const char * first_rejection = nullptr;
+    for (int layer : layers) {
+        ggml_cuda_d2f_packed_group & group = groups[layer];
+        const auto reject = [&](const char * reason) {
+            ++rejected_regions;
+            if (first_rejection == nullptr) {
+                first_rejected_layer = layer;
+                first_rejection = reason;
+            }
+            GGML_LOG_DEBUG(
+                    "D2F CUDA parallel Flash Attention not activated: layer=%d reason=%s\n",
+                    layer,
+                    reason);
+        };
+
+        if (group.duplicate_join || group.join == nullptr || group.lanes.size() < 2) {
+            reject("incomplete or duplicate lane/join markers");
+            continue;
+        }
+        std::sort(group.lanes.begin(), group.lanes.end(), [](const auto & lhs, const auto & rhs) {
+            return lhs.first < rhs.first;
+        });
+        bool lane_ids_valid = true;
+        for (size_t lane = 0; lane < group.lanes.size(); ++lane) {
+            lane_ids_valid = lane_ids_valid && group.lanes[lane].first == static_cast<int>(lane);
+        }
+        if (!lane_ids_valid) {
+            reject("lane ids are not unique and contiguous from zero");
+            continue;
+        }
+
+        std::set<const ggml_tensor *> lane_outputs;
+        for (const auto & lane : group.lanes) {
+            lane_outputs.insert(lane.second);
+        }
+        std::set<const ggml_tensor *> seen_lanes;
+        std::vector<const ggml_tensor *> concat_postorder;
+        if (!ggml_cuda_collect_d2f_concat_tree(
+                    group.join, lane_outputs, seen_lanes, concat_postorder) ||
+            seen_lanes != lane_outputs || concat_postorder.empty() ||
+            concat_postorder.back() != group.join) {
+            reject("join is not an exact dim-1 concat tree over all lanes");
+            continue;
+        }
+
+        std::vector<std::vector<const ggml_tensor *>> branches;
+        std::set<const ggml_tensor *> branch_members;
+        std::set<const ggml_tensor *> flash_nodes;
+        bool branches_valid = true;
+        branches.reserve(group.lanes.size());
+        for (const auto & lane : group.lanes) {
+            std::vector<const ggml_tensor *> branch;
+            const ggml_tensor * flash_attn = nullptr;
+            if (!ggml_cuda_trace_d2f_packed_lane(lane.second, flash_attn, branch) ||
+                !flash_nodes.insert(flash_attn).second) {
+                branches_valid = false;
+                break;
+            }
+            for (const ggml_tensor * node : branch) {
+                if (!branch_members.insert(node).second) {
+                    branches_valid = false;
+                    break;
+                }
+            }
+            branches.push_back(std::move(branch));
+            if (!branches_valid) {
+                break;
+            }
+        }
+        if (!branches_valid) {
+            reject("lane does not trace through a unique unmasked FA node");
+            continue;
+        }
+
+        const std::set<const ggml_tensor *> concat_members(
+                concat_postorder.begin(), concat_postorder.end());
+        bool consumers_valid = true;
+        for (int i = 0; i < cgraph->n_nodes && consumers_valid; ++i) {
+            const ggml_tensor * node = cgraph->nodes[i];
+            for (int src_index = 0; src_index < GGML_MAX_SRC; ++src_index) {
+                const ggml_tensor * src = node->src[src_index];
+                if (src == nullptr) {
+                    continue;
+                }
+                if (branch_members.count(src) != 0 &&
+                    branch_members.count(node) == 0 && concat_members.count(node) == 0) {
+                    consumers_valid = false;
+                    break;
+                }
+                if (concat_members.count(src) != 0 && src != group.join &&
+                    concat_members.count(node) == 0) {
+                    consumers_valid = false;
+                    break;
+                }
+            }
+        }
+        for (const auto & branch : branches) {
+            for (const ggml_tensor * node : branch) {
+                for (int src_index = 0; src_index < GGML_MAX_SRC; ++src_index) {
+                    if (concat_members.count(node->src[src_index]) != 0) {
+                        consumers_valid = false;
+                    }
+                }
+            }
+        }
+        if (!consumers_valid) {
+            reject("lane/concat nodes have an unexpected cross-region dependency");
+            continue;
+        }
+
+        int region_start = node_indices[group.join];
+        const int region_end = node_indices[group.join];
+        bool all_nodes_indexed = true;
+        for (const ggml_tensor * node : branch_members) {
+            const auto it = node_indices.find(node);
+            if (it == node_indices.end() || it->second > region_end) {
+                all_nodes_indexed = false;
+                break;
+            }
+            region_start = std::min(region_start, it->second);
+        }
+        for (const ggml_tensor * node : concat_members) {
+            const auto it = node_indices.find(node);
+            if (it == node_indices.end() || it->second > region_end) {
+                all_nodes_indexed = false;
+                break;
+            }
+            region_start = std::min(region_start, it->second);
+        }
+        if (!all_nodes_indexed) {
+            reject("lane or concat node lies outside its join region");
+            continue;
+        }
+
+        std::vector<const ggml_tensor *> prelude;
+        std::vector<const ggml_tensor *> branch_order;
+        for (const auto & branch : branches) {
+            branch_order.insert(branch_order.end(), branch.begin(), branch.end());
+        }
+        for (int i = region_start; i <= region_end; ++i) {
+            const ggml_tensor * node = cgraph->nodes[i];
+            if (branch_members.count(node) == 0 && concat_members.count(node) == 0) {
+                prelude.push_back(node);
+            }
+        }
+        const size_t region_size = static_cast<size_t>(region_end - region_start + 1);
+        if (prelude.size() + branch_order.size() + concat_postorder.size() != region_size) {
+            reject("packed region membership is inconsistent");
+            continue;
+        }
+
+        int write_index = region_start;
+        for (const ggml_tensor * node : prelude) {
+            cgraph->nodes[write_index++] = const_cast<ggml_tensor *>(node);
+        }
+        for (const ggml_tensor * node : branch_order) {
+            cgraph->nodes[write_index++] = const_cast<ggml_tensor *>(node);
+        }
+        for (const ggml_tensor * node : concat_postorder) {
+            cgraph->nodes[write_index++] = const_cast<ggml_tensor *>(node);
+        }
+        GGML_ASSERT(write_index == region_end + 1);
+
+        const int worker_streams = std::min<int>(
+                static_cast<int>(branches.size()),
+                GGML_CUDA_MAX_STREAMS - 1);
+        GGML_ASSERT(worker_streams > 0);
+        ggml_cuda_concurrent_event event(worker_streams);
+        event.join_node            = concat_postorder.front();
+        event.launch_before_fork   = true;
+        event.d2f_packed_attention = true;
+        event.d2f_layer            = layer;
+        event.d2f_domains          = static_cast<int>(branches.size());
+        event.original_order       = branch_order;
+        for (size_t lane = 0; lane < branches.size(); ++lane) {
+            const int stream = static_cast<int>(lane % worker_streams) + 1;
+            for (const ggml_tensor * node : branches[lane]) {
+                event.stream_mapping[node] = stream;
+            }
+        }
+
+        const ggml_tensor * fork_marker = branches.front().front();
+        auto & events = cuda_ctx->stream_context().concurrent_events;
+        if (events.find(fork_marker) != events.end()) {
+            reject("duplicate CUDA fork marker");
+            continue;
+        }
+        events.emplace(fork_marker, std::move(event));
+        ++optimized_regions;
+        GGML_LOG_DEBUG(
+                "D2F CUDA parallel Flash Attention candidate: layer=%d domains=%zu worker_streams=%d\n",
+                layer,
+                branches.size(),
+                worker_streams);
+    }
+
+    if (rejected_regions > 0) {
+        GGML_LOG_WARN(
+                "D2F CUDA parallel Flash Attention rejected regions: "
+                "rejected_regions=%d first_layer=%d first_reason=%s; "
+                "disabling the packed launch for this graph\n",
+                rejected_regions,
+                first_rejected_layer,
+                first_rejection);
+        // Do not let a partially recognized graph claim component-parallel
+        // execution. The reordered graph remains a valid sequential graph,
+        // but none of its regions are launched concurrently.
+        cuda_ctx->stream_context().concurrent_events.clear();
+        return -1;
+    }
+
+    return optimized_regions;
+}
+
 static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
@@ -4189,9 +4588,19 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     const bool use_cuda_graph = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 #else
     const bool use_cuda_graph = false;
-    GGML_UNUSED(cuda_ctx);
-    GGML_UNUSED(cgraph);
 #endif
+
+    ggml_cuda_stream_context & stream_context = cuda_ctx->stream_context();
+    stream_context.reset();
+
+    // Packed D2F is an explicit graph contract and does not require the
+    // opt-in generic Q/K/V graph optimizer. If it is present, prefer its
+    // dedicated fork/join regions so nested generic events cannot obscure the
+    // actual lane concurrency audit.
+    const int d2f_packed_regions = ggml_cuda_optimize_d2f_packed_attention(cuda_ctx, cgraph);
+    if (d2f_packed_regions != 0) {
+        return;
+    }
 
     static bool enable_graph_optimization = [] {
         const char * env     = getenv("GGML_CUDA_GRAPH_OPT");
@@ -4201,9 +4610,6 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     if (!enable_graph_optimization) {
         return;
     }
-
-    ggml_cuda_stream_context & stream_context = cuda_ctx->stream_context();
-    stream_context.reset();
 
     if (!use_cuda_graph || ggml_backend_cuda_get_device_count() != 1) {
         return;
@@ -5314,6 +5720,20 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// Queried through the backend registry so upper layers can prove that a
+// component-parallel decode actually launched validated CUDA fork/join work.
+// The counter advances once per CUDA backend graph compute containing at
+// least one activated D2F packed-attention region.
+static uint64_t ggml_backend_cuda_get_d2f_parallel_activation_count(ggml_backend_t backend) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return 0;
+    }
+
+    const ggml_backend_cuda_context * cuda_ctx =
+            static_cast<const ggml_backend_cuda_context *>(backend->context);
+    return cuda_ctx->d2f_parallel_activation_count.load(std::memory_order_relaxed);
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -5333,6 +5753,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_cuda_get_d2f_parallel_activation_count") == 0) {
+        return (void *)ggml_backend_cuda_get_d2f_parallel_activation_count;
     }
     return nullptr;
 }

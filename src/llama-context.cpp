@@ -13,6 +13,7 @@
 #include "llama-ext.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -30,6 +31,89 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
         case LLAMA_CONTEXT_TYPE_MTP    : return LLM_GRAPH_TYPE_DECODER_MTP;
     }
     throw std::runtime_error("Unsupported ctx type");
+}
+
+static bool d2f_packed_prefill_disabled(int32_t streams, int32_t tokens, int32_t lane_tokens) {
+    return streams == 0 && tokens == 0 && lane_tokens == 0;
+}
+
+static void validate_d2f_packed_prefill_config(
+        const llama_model & model,
+        const llama_cparams & cparams,
+        int32_t streams,
+        int32_t tokens,
+        int32_t lane_tokens) {
+    if (d2f_packed_prefill_disabled(streams, tokens, lane_tokens)) {
+        return;
+    }
+    if (streams < 2 || tokens <= 0 || lane_tokens <= 0) {
+        throw std::invalid_argument(
+                "packed D2F prefill must be disabled with three zeros or use at least two non-empty lanes");
+    }
+    if (model.arch != LLM_ARCH_LLADA && model.arch != LLM_ARCH_LLADA_MOE) {
+        throw std::invalid_argument("packed D2F prefill is supported only by LLaDA and LLaDA-MoE");
+    }
+    if (!cparams.flash_attn) {
+        throw std::invalid_argument("packed D2F prefill requires Flash Attention");
+    }
+    if (!cparams.kv_unified) {
+        throw std::invalid_argument("packed D2F prefill requires a unified KV cache");
+    }
+    if (streams > LLAMA_MAX_SEQ || static_cast<uint32_t>(streams) > cparams.n_seq_max) {
+        throw std::invalid_argument("packed D2F prefill streams exceed the context sequence capacity");
+    }
+    if (static_cast<uint32_t>(tokens) > cparams.n_batch ||
+        static_cast<uint32_t>(tokens) > cparams.n_ubatch ||
+        static_cast<uint32_t>(tokens) > cparams.n_ctx) {
+        throw std::invalid_argument("packed D2F prefill tokens exceed the context capacity");
+    }
+
+    const int64_t capacity = static_cast<int64_t>(streams)*lane_tokens;
+    const int64_t minimum_for_exact_max = static_cast<int64_t>(lane_tokens) + streams - 1;
+    if (tokens < streams || tokens > capacity || tokens < minimum_for_exact_max) {
+        throw std::invalid_argument("packed D2F prefill token and maximum-lane lengths are inconsistent");
+    }
+}
+
+static const char * validate_d2f_packed_prefill_batch(
+        const llama_batch & batch,
+        int32_t streams,
+        int32_t tokens,
+        int32_t lane_tokens) {
+    if (batch.n_tokens != tokens) {
+        return "batch token count does not match the packed declaration";
+    }
+    if (!batch.n_seq_id || !batch.seq_id) {
+        return "packed batches require explicit sequence metadata";
+    }
+
+    int32_t stream = 0;
+    int32_t run_length = 0;
+    int32_t maximum_run = 0;
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        if (batch.n_seq_id[i] != 1 || !batch.seq_id[i]) {
+            return "each packed token must belong to exactly one sequence";
+        }
+        const llama_seq_id seq_id = batch.seq_id[i][0];
+        if (seq_id == stream) {
+            ++run_length;
+            continue;
+        }
+        if (seq_id != stream + 1 || run_length == 0) {
+            return "packed sequence IDs must be contiguous runs numbered from zero";
+        }
+        maximum_run = std::max(maximum_run, run_length);
+        ++stream;
+        run_length = 1;
+    }
+    maximum_run = std::max(maximum_run, run_length);
+    if (stream + 1 != streams) {
+        return "packed batch sequence-run count does not match the declaration";
+    }
+    if (maximum_run != lane_tokens) {
+        return "packed batch maximum lane length does not match the declaration";
+    }
+    return nullptr;
 }
 
 struct llm_fused_op_probe {
@@ -482,6 +566,15 @@ llama_context::~llama_context() {
 
             const size_t size_exp = backend_buf_exp_size[i];
             const size_t size_act = ggml_backend_sched_get_buffer_size(sched.get(), backend);
+            if (sched_reserve_deferred) {
+                LLAMA_LOG_DEBUG(
+                        "%s: %10s compute buffer size is %8.4f MiB; "
+                        "synthetic expectation was intentionally deferred for packed D2F prefill\n",
+                        __func__,
+                        ggml_backend_buft_name(buft),
+                        size_act / (1024.0*1024.0));
+                continue;
+            }
             if (size_exp == size_act) {
                 LLAMA_LOG_DEBUG("%s: %10s compute buffer size is %8.4f MiB, matches expectation of %8.4f MiB\n",
                     __func__, ggml_backend_buft_name(buft), size_act / (1024.0*1024.0), size_exp / (1024.0*1024.0));
@@ -577,6 +670,7 @@ void llama_context::sched_reserve() {
     }
 
     sched_need_reserve = false;
+    sched_reserve_deferred = false;
 
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
 
@@ -609,6 +703,21 @@ void llama_context::sched_reserve() {
     const int n_outputs = n_seqs;
 
     LLAMA_LOG_DEBUG("%s: worst-case: n_tokens = %d, n_seqs = %d, n_outputs = %d\n", __func__, n_tokens, n_seqs, n_outputs);
+
+    // Synthetic reserve cannot encode ragged lane lengths and allocates a dense mask.
+    if (cparams.d2f_packed_prefill_streams > 1 &&
+        cparams.d2f_packed_prefill_tokens > 0 &&
+        cparams.d2f_packed_prefill_lane > 0) {
+        sched_reserve_deferred = true;
+        LLAMA_LOG_INFO(
+                "%s: deferring synthetic reserve for D2F packed prefill "
+                "(streams = %d, tokens = %d, lane = %d)\n",
+                __func__,
+                cparams.d2f_packed_prefill_streams,
+                cparams.d2f_packed_prefill_tokens,
+                cparams.d2f_packed_prefill_lane);
+        return;
+    }
 
     resolve_fused_ops(mctx.get(), n_seqs);
 
@@ -759,6 +868,37 @@ uint32_t llama_context::n_ubatch() const {
 
 uint32_t llama_context::n_seq_max() const {
     return cparams.n_seq_max;
+}
+
+uint32_t llama_context::d2f_packed_prefill_stream_capacity_max() const {
+    return d2f_packed_prefill_stream_capacity;
+}
+
+uint64_t llama_context::d2f_parallel_activation_count() const {
+    using activation_count_fn = uint64_t (*)(ggml_backend_t);
+
+    uint64_t result = 0;
+    const int n_backends = ggml_backend_sched_get_n_backends(sched.get());
+    for (int i = 0; i < n_backends; ++i) {
+        ggml_backend_t backend = ggml_backend_sched_get_backend(sched.get(), i);
+        ggml_backend_dev_t device = ggml_backend_get_device(backend);
+        ggml_backend_reg_t registry = device ? ggml_backend_dev_backend_reg(device) : nullptr;
+        activation_count_fn get_count = registry
+                ? reinterpret_cast<activation_count_fn>(ggml_backend_reg_get_proc_address(
+                        registry,
+                        "ggml_backend_cuda_get_d2f_parallel_activation_count"))
+                : nullptr;
+        if (!get_count) {
+            continue;
+        }
+
+        const uint64_t count = get_count(backend);
+        if (count > std::numeric_limits<uint64_t>::max() - result) {
+            return std::numeric_limits<uint64_t>::max();
+        }
+        result += count;
+    }
+    return result;
 }
 
 uint32_t llama_context::n_threads() const {
@@ -1239,6 +1379,31 @@ void llama_context::set_d2f_attention(
     cparams.d2f_generation_position = generation_position;
     cparams.d2f_block_size = block_size;
     sched_need_reserve = true;
+}
+
+void llama_context::set_d2f_packed_prefill(int32_t streams, int32_t tokens, int32_t lane_tokens) {
+    validate_d2f_packed_prefill_config(model, cparams, streams, tokens, lane_tokens);
+
+    LLAMA_LOG_DEBUG(
+            "%s: streams = %d, tokens = %d, lane_tokens = %d\n",
+            __func__, streams, tokens, lane_tokens);
+
+    if (cparams.d2f_packed_prefill_streams == streams &&
+        cparams.d2f_packed_prefill_tokens == tokens &&
+        cparams.d2f_packed_prefill_lane == lane_tokens) {
+        return;
+    }
+
+    const bool grows_graph = streams > d2f_packed_prefill_stream_capacity;
+    d2f_packed_prefill_stream_capacity = std::max(
+            d2f_packed_prefill_stream_capacity,
+            streams);
+    cparams.d2f_packed_prefill_streams = streams;
+    cparams.d2f_packed_prefill_tokens = tokens;
+    cparams.d2f_packed_prefill_lane = lane_tokens;
+    // Clearing keeps the scheduler's stream high-water mark. A later request
+    // with the same or fewer lanes can reuse its graph metadata allocation.
+    sched_need_reserve |= grows_graph;
 }
 
 void llama_context::set_warmup(bool value) {
@@ -1788,6 +1953,21 @@ int llama_context::decode(const llama_batch & batch_inp) {
     if (batch_inp.n_tokens == 0) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
+    }
+
+    if (!d2f_packed_prefill_disabled(
+                cparams.d2f_packed_prefill_streams,
+                cparams.d2f_packed_prefill_tokens,
+                cparams.d2f_packed_prefill_lane)) {
+        const char * error = validate_d2f_packed_prefill_batch(
+                batch_inp,
+                cparams.d2f_packed_prefill_streams,
+                cparams.d2f_packed_prefill_tokens,
+                cparams.d2f_packed_prefill_lane);
+        if (error) {
+            LLAMA_LOG_ERROR("%s: invalid packed D2F prefill: %s\n", __func__, error);
+            return -1;
+        }
     }
 
     const auto & vocab   = model.vocab;
@@ -2436,11 +2616,24 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         model.arch == LLM_ARCH_MINIMAX_M3) {
         return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
     }
-    uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
+    uint64_t res = std::max<uint64_t>(1024u, 8ull*model.n_tensors());
+
+    // A packed image graph creates one exact attention branch per span on
+    // every language layer. Budget the additional views, permutations,
+    // attention outputs and balanced joins instead of relying on the normal
+    // single-attention graph estimate.
+    if (d2f_packed_prefill_stream_capacity > 1) {
+        constexpr uint64_t nodes_per_extra_stream_layer = 24;
+        res += static_cast<uint64_t>(d2f_packed_prefill_stream_capacity - 1)*
+                model.hparams.n_layer()*nodes_per_extra_stream_layer;
+    }
     for (const auto & lora : model.loras) {
         res += lora->get_n_nodes();
     }
-    return res;
+    if (res > std::numeric_limits<uint32_t>::max()) {
+        throw std::overflow_error("compute graph node budget exceeds uint32 range");
+    }
+    return static_cast<uint32_t>(res);
 }
 
 llm_graph_result * llama_context::get_gf_res_reserve() const {
@@ -3736,6 +3929,10 @@ enum llama_flash_attn_type llama_context_flash_attn_type(const llama_context * c
             : LLAMA_FLASH_ATTN_TYPE_DISABLED;
 }
 
+uint64_t llama_context_d2f_parallel_activation_count(const llama_context * ctx) {
+    return ctx->d2f_parallel_activation_count();
+}
+
 const llama_model * llama_get_model(const llama_context * ctx) {
     return &ctx->get_model();
 }
@@ -3792,6 +3989,14 @@ void llama_set_d2f_attention(
             prompt_position,
             generation_position,
             block_size);
+}
+
+void llama_set_d2f_packed_prefill(
+        llama_context * ctx,
+        int32_t streams,
+        int32_t tokens,
+        int32_t lane_tokens) {
+    ctx->set_d2f_packed_prefill(streams, tokens, lane_tokens);
 }
 
 void llama_set_warmup(llama_context * ctx, bool warmup) {

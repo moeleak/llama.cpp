@@ -322,5 +322,11 @@ int main() {
     params.flash_attention_mode = lladao::d2f_flash_attention_mode::disabled;
     require_configuration_valid(params);
 
+    params.prefix_prefill_mode = lladao::d2f_prefix_prefill_mode::component_parallel;
+    require_invalid(params);
+
+    params.flash_attention_mode = lladao::d2f_flash_attention_mode::auto_select;
+    require_configuration_valid(params);
+
     return 0;
 }

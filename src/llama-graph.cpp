@@ -24,19 +24,134 @@
 
 // dedup helpers
 
+struct d2f_packed_prefill_layout {
+    int64_t n_stream = 0;
+    int64_t lane_tokens = 0;
+    std::vector<int64_t> offsets;
+    std::vector<int64_t> lengths;
+
+    explicit operator bool() const {
+        return n_stream > 1 && lane_tokens > 0;
+    }
+};
+
+static d2f_packed_prefill_layout get_d2f_packed_prefill_layout(
+        const llama_ubatch & ubatch,
+        const llama_cparams & cparams,
+        const llama_kv_cache_context * mctx) {
+    const int64_t n_stream = cparams.d2f_packed_prefill_streams;
+    const int64_t n_tokens = cparams.d2f_packed_prefill_tokens;
+    const int64_t lane_tokens = cparams.d2f_packed_prefill_lane;
+    if (n_stream == 0 && n_tokens == 0 && lane_tokens == 0) {
+        return {};
+    }
+    const auto fail = [](const char * reason) -> d2f_packed_prefill_layout {
+        throw std::runtime_error(std::string("invalid packed D2F prefill graph: ") + reason);
+    };
+    if (n_stream < 2 || n_tokens <= 0 || lane_tokens <= 0) {
+        return fail("incomplete packed configuration");
+    }
+    if (!cparams.kv_unified) {
+        return fail("unified KV is disabled");
+    }
+    if (cparams.n_seq_max < static_cast<uint32_t>(n_stream)) {
+        return fail("stream count exceeds sequence capacity");
+    }
+    if (ubatch.n_tokens != n_tokens) {
+        return fail("ubatch token count does not match the declaration");
+    }
+    if (!mctx || mctx->get_n_kv() < static_cast<uint32_t>(n_tokens)) {
+        return fail("KV cache does not contain every packed token");
+    }
+
+    d2f_packed_prefill_layout result;
+    result.n_stream = n_stream;
+    int64_t offset = 0;
+    for (int64_t stream = 0; stream < n_stream; ++stream) {
+        if (offset >= n_tokens || ubatch.n_seq_id[offset] != 1 ||
+            ubatch.seq_id[offset][0] != stream) {
+            return fail("sequence IDs are not contiguous runs numbered from zero");
+        }
+        int64_t end = offset + 1;
+        while (end < n_tokens && ubatch.n_seq_id[end] == 1 &&
+               ubatch.seq_id[end][0] == stream) {
+            ++end;
+        }
+        result.offsets.push_back(offset);
+        result.lengths.push_back(end - offset);
+        result.lane_tokens = std::max(result.lane_tokens, end - offset);
+        offset = end;
+    }
+    if (offset != n_tokens) {
+        return fail("batch has extra or interleaved sequence runs");
+    }
+    if (result.lane_tokens != lane_tokens) {
+        return fail("maximum lane length does not match the declaration");
+    }
+    return result;
+}
+
+static ggml_tensor * d2f_view_packed_attention_lane(
+        ggml_context * ctx,
+        ggml_tensor * source,
+        const d2f_packed_prefill_layout & layout,
+        int64_t stream) {
+    GGML_ASSERT(layout);
+    GGML_ASSERT(stream >= 0 && stream < layout.n_stream);
+    GGML_ASSERT(source->ne[3] == 1);
+    GGML_ASSERT(source->ne[2] >=
+            std::accumulate(layout.lengths.begin(), layout.lengths.end(), int64_t(0)));
+    return ggml_view_3d(
+            ctx,
+            source,
+            source->ne[0],
+            source->ne[1],
+            layout.lengths[stream],
+            source->nb[1],
+            source->nb[2],
+            layout.offsets[stream]*source->nb[2]);
+}
+
+static ggml_tensor * d2f_join_packed_attention_lanes(
+        ggml_context * ctx,
+        std::vector<ggml_tensor *> lanes) {
+    GGML_ASSERT(!lanes.empty());
+    while (lanes.size() > 1) {
+        std::vector<ggml_tensor *> joined;
+        joined.reserve((lanes.size() + 1)/2);
+        for (size_t i = 0; i < lanes.size(); i += 2) {
+            joined.push_back(i + 1 < lanes.size()
+                    ? ggml_concat(ctx, lanes[i], lanes[i + 1], 1)
+                    : lanes[i]);
+        }
+        lanes = std::move(joined);
+    }
+    return lanes.front();
+}
+
 static ggml_tensor * build_attn_inp_kq_mask(
         ggml_context * ctx,
         const llama_kv_cache_context * mctx,
         const llama_ubatch & ubatch,
         const llama_cparams & cparams) {
-    const auto n_kv     = mctx->get_n_kv();
+    const auto n_kv_all = mctx->get_n_kv();
     const auto n_tokens = ubatch.n_tokens;
-    const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+    const auto packed = get_d2f_packed_prefill_layout(ubatch, cparams, mctx);
+    if (packed) {
+        // Each span is fully bidirectional and cannot see another span's keys.
+        return nullptr;
+    }
+    const auto n_stream = packed
+            ? packed.n_stream
+            : cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+    const auto n_kv = packed ? packed.lane_tokens : n_kv_all/n_stream;
+    const auto n_queries = packed ? packed.lane_tokens : n_tokens/n_stream;
+    GGML_ASSERT(packed || (n_kv_all % n_stream == 0 && n_tokens % n_stream == 0));
 
     // flash attention requires an f16 mask
     const auto type = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
 
-    ggml_tensor * res = ggml_new_tensor_4d(ctx, type, n_kv, n_tokens/n_stream, 1, n_stream);
+    ggml_tensor * res = ggml_new_tensor_4d(ctx, type, n_kv, n_queries, 1, n_stream);
     ggml_set_input(res);
     ggml_set_name(res, "attn_inp_kq_mask");
 
@@ -48,16 +163,29 @@ static bool can_reuse_kq_mask(
         const llama_kv_cache_context * mctx,
         const llama_ubatch & ubatch,
         const llama_cparams & cparams) {
-    const auto n_kv     = mctx->get_n_kv();
+    const auto n_kv_all = mctx->get_n_kv();
     const auto n_tokens = ubatch.n_tokens;
-    const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+    const auto packed = get_d2f_packed_prefill_layout(ubatch, cparams, mctx);
+    const auto n_stream = packed
+            ? packed.n_stream
+            : cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+    if (!packed && (n_kv_all % n_stream != 0 || n_tokens % n_stream != 0)) {
+        return false;
+    }
+    const auto n_kv = packed ? packed.lane_tokens : n_kv_all/n_stream;
+    const auto n_queries = packed ? packed.lane_tokens : n_tokens/n_stream;
 
     bool res = true;
 
     res &= (kq_mask->ne[0] == n_kv);
-    res &= (kq_mask->ne[1] == n_tokens/n_stream);
+    res &= (kq_mask->ne[1] == n_queries);
     res &= (kq_mask->ne[2] == 1);
     res &= (kq_mask->ne[3] == n_stream);
+
+    // Packed graph views contain span-specific slices and padding nodes. They
+    // must be rebuilt if the per-span lengths change, even when tensor shapes
+    // happen to match.
+    res &= !packed;
 
     return res;
 }
@@ -522,6 +650,10 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     this->mctx = mctx;
 
     bool res = true;
+
+    if (!self_kq_mask) {
+        return false;
+    }
 
     res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
@@ -2714,12 +2846,38 @@ ggml_tensor * llm_graph_context::build_attn(
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
 
-    ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
-
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    const d2f_packed_prefill_layout packed =
+            get_d2f_packed_prefill_layout(ubatch, cparams, mctx_cur);
+    ggml_tensor * cur = nullptr;
+    if (packed) {
+        ggml_tensor * k_cache = mctx_cur->get_k(ctx0, il);
+        ggml_tensor * v_cache = mctx_cur->get_v(ctx0, il);
+        std::vector<ggml_tensor *> lanes;
+        lanes.reserve(packed.n_stream);
+        // The output projection and FFN consume the joined real-token rows.
+        for (int64_t stream = 0; stream < packed.n_stream; ++stream) {
+            ggml_tensor * lane_q = d2f_view_packed_attention_lane(ctx0, q_cur, packed, stream);
+            ggml_tensor * lane_k = d2f_view_packed_attention_lane(ctx0, k_cache, packed, stream);
+            ggml_tensor * lane_v = d2f_view_packed_attention_lane(ctx0, v_cache, packed, stream);
+            ggml_tensor * lane = build_attn_mha(
+                    lane_q, lane_k, lane_v, kq_b, nullptr, sinks, v_mla, kq_scale, il);
+            ggml_format_name(lane, "d2f_packed_attn_lane-%d-%d", il, static_cast<int>(stream));
+            lanes.push_back(lane);
+        }
+        cur = d2f_join_packed_attention_lanes(ctx0, std::move(lanes));
+        GGML_ASSERT(cur && cur->ne[1] == ubatch.n_tokens);
+    } else {
+        ggml_tensor * q = q_cur;
+        ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+        ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+        cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    }
     cb(cur, "kqv_out", il);
+    if (packed) {
+        // The model callback names kqv_out; restore the marker consumed by the
+        // CUDA packed-branch scheduler after that callback.
+        ggml_format_name(cur, "d2f_packed_attn_join-%d", il);
+    }
 
     if (inp->self_v_rot) {
         cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);

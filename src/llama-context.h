@@ -67,6 +67,8 @@ struct llama_context {
     uint32_t n_batch()   const;
     uint32_t n_ubatch()  const;
     uint32_t n_seq_max() const;
+    uint32_t d2f_packed_prefill_stream_capacity_max() const;
+    uint64_t d2f_parallel_activation_count() const;
 
     uint32_t n_threads()       const;
     uint32_t n_threads_batch() const;
@@ -131,6 +133,8 @@ struct llama_context {
             int32_t prompt_position,
             int32_t generation_position,
             int32_t block_size);
+
+    void set_d2f_packed_prefill(int32_t streams, int32_t tokens, int32_t lane_tokens);
     void set_warmup(bool value);
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
@@ -358,6 +362,8 @@ private:
     ggml_backend_sched_ptr sched;
 
     bool sched_need_reserve = true;
+    bool sched_reserve_deferred = false;
+    int32_t d2f_packed_prefill_stream_capacity = 0;
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;

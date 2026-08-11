@@ -28,6 +28,13 @@ struct llama_cparams {
     int32_t d2f_generation_position = -1;
     int32_t d2f_block_size          = 0;
 
+    // Optional packed image-prefill lanes for D2F. When the current ubatch
+    // contains exactly d2f_packed_prefill_tokens, contiguous sequence-id runs
+    // become independent exact-sized attention branches in one graph.
+    int32_t d2f_packed_prefill_streams = 0;
+    int32_t d2f_packed_prefill_tokens  = 0;
+    int32_t d2f_packed_prefill_lane    = 0;
+
     float rope_freq_base;
     float rope_freq_scale;
 

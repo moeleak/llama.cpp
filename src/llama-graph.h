@@ -782,6 +782,9 @@ struct llm_graph_params {
             cparams.d2f_prompt_position     == other.cparams.d2f_prompt_position     &&
             cparams.d2f_generation_position == other.cparams.d2f_generation_position &&
             cparams.d2f_block_size          == other.cparams.d2f_block_size          &&
+            cparams.d2f_packed_prefill_streams == other.cparams.d2f_packed_prefill_streams &&
+            cparams.d2f_packed_prefill_tokens  == other.cparams.d2f_packed_prefill_tokens  &&
+            cparams.d2f_packed_prefill_lane    == other.cparams.d2f_packed_prefill_lane    &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&

@@ -4,6 +4,7 @@
 #include "ggml-impl.h"
 #include "ggml-cuda.h"
 
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
@@ -1236,6 +1237,8 @@ struct ggml_cuda_graph {
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;
     bool warmup_complete = false;
+    // True when the captured graph contains validated D2F fork/join regions.
+    bool d2f_packed_attention = false;
     uint64_t uid = 0;
     int64_t last_used_time = 0;
     struct node_properties {
@@ -1266,6 +1269,18 @@ struct ggml_cuda_concurrent_event {
 
     const ggml_tensor * join_node;
 
+    // Most concurrent regions fork after their key node has executed. Packed
+    // D2F attention instead uses its first Flash Attention node as an explicit
+    // marker and must fork immediately before that node is launched.
+    bool launch_before_fork = false;
+
+    // Runtime audit metadata. This is intentionally attached to the validated
+    // CUDA event rather than inferred by the model frontend: a log is emitted
+    // only after is_valid() succeeds and the multi-stream fork really launches.
+    bool d2f_packed_attention = false;
+    int  d2f_layer            = -1;
+    int  d2f_domains          = 0;
+
     ggml_cuda_concurrent_event() = default;
 
     ggml_cuda_concurrent_event(const ggml_cuda_concurrent_event &) = delete;
@@ -1287,7 +1302,11 @@ struct ggml_cuda_concurrent_event {
     , n_streams(other.n_streams)
     , stream_mapping(std::move(other.stream_mapping))
     , original_order(std::move(other.original_order))
-    , join_node(other.join_node) {
+    , join_node(other.join_node)
+    , launch_before_fork(other.launch_before_fork)
+    , d2f_packed_attention(other.d2f_packed_attention)
+    , d2f_layer(other.d2f_layer)
+    , d2f_domains(other.d2f_domains) {
         other.fork_event = nullptr;
     }
 
@@ -1398,9 +1417,12 @@ struct ggml_cuda_concurrent_event {
 
 struct ggml_cuda_stream_context {
     std::unordered_map<const ggml_tensor *, ggml_cuda_concurrent_event> concurrent_events;
+    bool d2f_activation_summary_logged = false;
+    bool d2f_events_validated = false;
 
     void reset() {
         concurrent_events.clear();
+        d2f_events_validated = false;
     }
 };
 
@@ -1408,6 +1430,7 @@ struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
+    std::atomic<uint64_t> d2f_parallel_activation_count { 0 };
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
@@ -1658,4 +1681,3 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
     CUDA_CHECK(cudaGetLastError());
 }
-

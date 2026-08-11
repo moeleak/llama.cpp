@@ -83,6 +83,7 @@ struct d2f_result {
     std::string flash_attention_requested;
     std::string flash_attention_resolved;
     std::string prefix_prefill_mode;
+    std::string backend;
     std::string cpu_mask_requested;
     std::string cpu_mask_resolved;
     int32_t prefix_pack_size = 0;
@@ -91,6 +92,7 @@ struct d2f_result {
     int32_t image_prefill_calls = 0;
     int32_t dense_prefix_tokens = 0;
     int32_t cached_prefix_tokens = 0;
+    int32_t physical_prefix_tokens = 0;
     int32_t vision_patches = 0;
     int32_t vision_kept_patches = 0;
     int32_t vision_tiles = 0;
@@ -108,6 +110,12 @@ struct d2f_result {
     uint64_t d2f_rebuild_rows = 0;
     uint64_t d2f_logit_rows = 0;
     uint64_t d2f_reused_input_rows = 0;
+    uint64_t attention_pairs_dense = 0;
+    uint64_t attention_pairs_packed = 0;
+    uint64_t attention_pairs_executed = 0;
+    uint64_t parallel_activation_count_delta = 0;
+    int32_t parallel_lane_tokens = 0;
+    int32_t parallel_padding_tokens = 0;
     double prefill_seconds = 0.0;
     double state_io_seconds = 0.0;
     double decode_seconds = 0.0;
@@ -129,6 +137,12 @@ struct d2f_result {
     bool preprocessed_only = false;
     bool prefilled_only = false;
     bool decoded_from_state = false;
+    bool batched_prefill = false;
+    bool attention_pairs_executed_known = false;
+    // True only when a backend reports a validated packed-attention activation
+    // during this request, not merely because one graph was submitted.
+    bool parallel_effective = false;
+    int32_t domains = 0;
 };
 
 namespace detail {

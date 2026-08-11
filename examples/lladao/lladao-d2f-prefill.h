@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace lladao::detail {
@@ -22,6 +24,58 @@ struct prefix_chunk {
     prefix_chunk_kind kind = prefix_chunk_kind::complete;
     int32_t component = -1;
 };
+
+struct prefix_parallel_audit {
+    std::vector<int32_t> cu_seqlens;
+    int64_t attention_pairs_dense = 0;
+    int64_t attention_pairs_packed = 0;
+    int32_t domains = 0;
+    int32_t image_decode_calls = 0;
+    bool flash_attention_resolved = false;
+    bool batched_submission = false;
+};
+
+struct language_context_capacity {
+    int32_t resident = 0;
+    int32_t batch = 0;
+    int32_t outputs = 0;
+    int32_t sequences = 0;
+};
+
+template<typename Enable, typename Clear, typename Body>
+decltype(auto) with_packed_prefill_contract(
+        Enable && enable,
+        Clear && clear,
+        Body && body) {
+    enable();
+
+    using clear_type = typename std::remove_reference<Clear>::type;
+    static_assert(noexcept(std::declval<clear_type &>()()),
+            "packed prefill clear callback must be noexcept");
+    struct clear_guard {
+        clear_type * clear;
+
+        ~clear_guard() noexcept {
+            (*clear)();
+        }
+    } guard { &clear };
+
+    return std::forward<Body>(body)();
+}
+
+inline bool language_context_needs_rebuild(
+        bool context_present,
+        const language_context_capacity & capacity,
+        int32_t required_resident,
+        int32_t required_batch,
+        int32_t required_outputs,
+        int32_t required_sequences) {
+    return !context_present ||
+           required_resident > capacity.resident ||
+           required_batch > capacity.batch ||
+           required_outputs > capacity.outputs ||
+           required_sequences > capacity.sequences;
+}
 
 inline const char * prefix_prefill_mode_name(d2f_prefix_prefill_mode mode) {
     switch (mode) {
@@ -90,6 +144,75 @@ inline std::vector<prefix_chunk> plan_prefix_chunks(
     }
     chunks.push_back({ offset, prompt_length, prefix_chunk_kind::prompt, -1 });
     return chunks;
+}
+
+inline prefix_parallel_audit audit_prefix_parallelism(
+        const std::vector<int32_t> & image_lengths,
+        d2f_prefix_prefill_mode mode,
+        bool flash_attention_resolved,
+        int32_t pack_size = 512) {
+    if (image_lengths.empty()) {
+        throw std::invalid_argument("parallel prefix audit requires at least one image span");
+    }
+
+    prefix_parallel_audit result;
+    result.cu_seqlens.reserve(image_lengths.size() + 1);
+    result.cu_seqlens.push_back(0);
+    int64_t total_length = 0;
+    for (int32_t image_length : image_lengths) {
+        if (image_length <= 0) {
+            throw std::invalid_argument("image prefix spans must not be empty");
+        }
+        total_length += image_length;
+        if (total_length > std::numeric_limits<int32_t>::max()) {
+            throw std::overflow_error("prefix length exceeds int32 range");
+        }
+        result.cu_seqlens.push_back(static_cast<int32_t>(total_length));
+        result.attention_pairs_packed += static_cast<int64_t>(image_length) * image_length;
+    }
+    result.attention_pairs_dense = total_length * total_length;
+    result.domains = static_cast<int32_t>(image_lengths.size());
+    result.flash_attention_resolved = flash_attention_resolved;
+
+    const std::vector<prefix_chunk> chunks = plan_prefix_chunks(image_lengths, 1, mode, pack_size);
+    result.image_decode_calls = static_cast<int32_t>(std::count_if(
+            chunks.begin(),
+            chunks.end(),
+            [](const prefix_chunk & chunk) {
+                return chunk.kind == prefix_chunk_kind::image;
+            }));
+    result.batched_submission =
+            mode == d2f_prefix_prefill_mode::component_parallel &&
+            result.domains > 1 &&
+            result.image_decode_calls == 1;
+    return result;
+}
+
+inline void validate_prefix_parallel_backend(
+        d2f_prefix_prefill_mode mode,
+        bool flash_attention_resolved) {
+    if (mode == d2f_prefix_prefill_mode::component_parallel && !flash_attention_resolved) {
+        throw std::invalid_argument("component_parallel prefill requires resolved Flash Attention");
+    }
+}
+
+inline int32_t prefix_attention_domain(
+        const prefix_parallel_audit & audit,
+        int32_t token_index) {
+    if (audit.cu_seqlens.size() < 2 || token_index < 0 || token_index >= audit.cu_seqlens.back()) {
+        throw std::out_of_range("packed prefix token index is out of range");
+    }
+    const auto boundary = std::upper_bound(
+            audit.cu_seqlens.begin(), audit.cu_seqlens.end(), token_index);
+    return static_cast<int32_t>(boundary - audit.cu_seqlens.begin() - 1);
+}
+
+inline bool prefix_attention_allowed(
+        const prefix_parallel_audit & audit,
+        int32_t query_index,
+        int32_t key_index) {
+    return prefix_attention_domain(audit, query_index) ==
+           prefix_attention_domain(audit, key_index);
 }
 
 inline int32_t prefix_chunk_ubatch(

@@ -1345,7 +1345,7 @@ bool llama_kv_cache::compact_heads(
           const uint32_t * src_ordinals,
                    size_t   n_src_ordinals,
         const llama_pos * dst_positions) {
-    if (n_stream != 1 || n_seq_max != 1 || seq_id != 0) {
+    if (n_stream != 1 || seq_id != 0) {
         LLAMA_LOG_ERROR("%s: requires a unified single-sequence cache with sequence id 0\n", __func__);
         return false;
     }

@@ -77,31 +77,79 @@ rebuild all dependents; do not combine a new header with an old library.
 Prefix prefill has four explicit modes:
 
 - `--prefix-prefill-mode exact` is the default and submits the complete image
-  plus prompt prefix as one fully bidirectional batch.
+  plus prompt prefix as one batch with native D2F visibility: image tokens are
+  bidirectional only inside their image span, while prompt tokens can see the
+  complete image-and-text prefix.
 - `--prefix-prefill-mode component_exact` submits each complete image span and
   then the complete prompt. It preserves exact visibility while reducing the
   largest microbatch from the full prefix to its largest component.
 - `--prefix-prefill-mode component_parallel` submits all complete image spans
   together as one image-only batch, then submits the complete prompt. The D2F
-  position mask keeps image spans independent while preserving the same prompt
-  visibility as `exact`; this trades a larger image microbatch for one fewer
-  model call per additional image. All image spans execute in one
-  `llama_decode()` graph. This is dense masked execution, not a varlen or
-  block-sparse attention kernel, so masked cross-span work is still present.
+  graph builds one exact-sized Flash Attention branch per image span, joins the
+  real-token outputs, and then runs the shared output projection and FFN. No
+  cross-span QK pairs or padding tokens are evaluated or stored. All image
+  spans execute in one `llama_decode()` graph without a host synchronization
+  between spans. This mode requires resolved Flash Attention and does not
+  silently fall back to the non-FA path. It is a ragged multi-branch graph, not
+  a backend-specific `cu_seqlens` kernel. CUDA may schedule validated lane
+  branches on multiple worker streams; only
+  `D2F CUDA parallel Flash Attention activated: ...` confirms that validated
+  packed-attention regions were enabled at runtime. Other backends make no
+  hardware-concurrency claim.
 - `--prefix-prefill-mode packed_image --prefix-pack-size 512` splits only image
   spans into bounded chunks and still submits the complete prompt at once. It
   changes image-token visibility across chunk boundaries, so it is an opt-in
   performance/quality ablation rather than the default.
 
-The modified Python GUI runtime's normal `_forward_image_spans()` path loops
-over image spans sequentially; `component_exact` is the matching llama.cpp
-mode. `component_parallel` is an additional llama.cpp one-graph optimization,
-not a claim that the Python loop runs spans concurrently. The separate
-FastDLLM `generate_token_ids_from_chunk_local_kv()` path also loops over local
+The modified Python GUI runtime's normal `_forward_image_spans()` generation
+path loops over image spans sequentially; `component_exact` matches that path.
+Its `_forward_packed_image_spans()` retrieval primitive packs spans with
+`cu_seqlens` into one varlen forward. `component_parallel` applies the same
+independent-span visibility to the generation prefill using llama.cpp ragged
+graph branches. The separate FastDLLM
+`generate_token_ids_from_chunk_local_kv()` path loops over local
 `prefix + chunk + query` prefills before copying per-head K/V; it is a distinct
-text-chunk algorithm rather than the GUI image-span path.
+text-chunk algorithm.
 
 Every chunk boundary, token range, component index, and elapsed time is logged.
+`component_parallel` reports `batched_prefill`, `domains`, the actual number of
+image decode calls, `attention_pairs_dense`, `attention_pairs_packed`,
+`attention_pairs_executed`, and the selected backend. The executed-pair count
+is marked known only for the exact ragged branches. `batched_prefill=true`
+means one image-only `llama_decode()` submitted all domains; it does not claim
+that the backend ran the per-domain Flash Attention nodes concurrently.
+`parallel_activation_count_delta` is the backend-reported number of validated
+packed-attention graph computes activated during that image decode, and
+`parallel_effective=true` requires both a batched submission and a positive
+delta. CPU, Metal, and other backends without this audit hook report zero and
+do not claim hardware parallelism.
+
+A fixed three-span A800 diagnostic used the same Q3_K_L language model, Q8_0
+vision projector, screenshot, prompt, 16K context, F16 KV cache, Flash
+Attention, and D2F decoding for both modes. The full-page tile lengths were
+3642, 1146, and 2732 tokens; retrieval and KV compression were disabled. Each
+row contains three measured runs. P90 is reported only as a small-run
+stability diagnostic.
+
+| Mode | Image median / p90 | Prompt median / p90 | Prefix median / p90 | Engine total median / p90 | Request median / p90 | Peak GPU | CUDA compute | CUDA activation |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `component_exact` | 2.661 / 2.709 s | 0.0548 / 0.0548 s | 2.716 / 2.763 s | 3.218 / 3.266 s | 4.372 / 4.534 s | 9094 MiB | 736.3 MiB | 0 |
+| `component_parallel` | 2.244 / 2.248 s | 0.0559 / 0.0560 s | 2.299 / 2.303 s | 2.810 / 3.552 s | 4.058 / 5.085 s | 9756 MiB | 1520.5 MiB | 1 |
+
+The parallel path reduced median image prefill by 15.67 percent, complete
+prefix prefill by 15.34 percent, engine time by 12.69 percent, and request time
+by 7.18 percent. It increased peak GPU memory by 662 MiB and CUDA compute
+workspace by 784.2 MiB. All 32 language layers reported three CUDA domains and
+three worker streams. The parallel output matched the previous `exact` mode
+byte for byte. Compared with `component_exact`, its parsed action was the same
+and the box center moved by 1/1000 on the y axis because the packed and
+per-span graph shapes select different stable floating-point kernel paths.
+`CUDA_LAUNCH_BLOCKING=1` reproduced the packed output, excluding stream overlap
+as the source of that difference. This diagnostic has no bound ground-truth
+box and therefore does not claim an SSR result. One parallel generation run
+was a first-run outlier, so the three-run p90 values are not a tail-latency
+improvement claim.
+
 `--release-vision-after-encode` releases the native vision context after the
 image embedding has been cached. A repeated request with the same non-empty
 image cache key can reuse that embedding without rebuilding vision; a cache
@@ -133,24 +181,6 @@ not shrink that already allocated tensor or its RSS. F16 cache scoring uses
 F32 post-RoPE K before the cache write; a quantized K cache can therefore pick
 slightly different patches from a scorer that reads quantized cache K. Visual
 KV compaction is currently incompatible with PD state export/import.
-
-A three-image-span Metal smoke comparison used the same Q3_K_L language GGUF,
-Q8_0 projector, F16 grounding adapter, 720x1280 screenshot, `Open Settings`
-prompt, 16K context, and deterministic D2F settings. All three arms returned
-the same output bytes:
-
-| Prefix mode | Image calls | Active prefix | Prefill | KV compact | Decode | Total |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `component_exact` | 3 | 7,612 | 35.014 s | 0 s | 3.134 s | 38.183 s |
-| `component_parallel` | 1 | 7,612 | 34.205 s | 0 s | 3.167 s | 37.404 s |
-| `component_parallel` + visual KV compaction | 1 | 5,734 | 37.064 s | 6.219 s | 3.313 s | 46.634 s |
-
-The one-call parallel arm reduced prefill by 2.31 percent and total time by
-2.04 percent in this smoke run. Its largest Metal compute buffer increased
-from about 679 MiB to 1,403 MiB because the implementation is dense masked.
-KV compaction reduced the active prefix by 24.67 percent, but its CPU scoring
-and host-staged gather cost outweighed the shorter decode in this run. These
-are single-run implementation measurements, not a 100-sample accuracy result.
 
 `--flash-attn` accepts `auto`, `enabled`, or `disabled`. F16 K/V cache supports
 all three settings. A Q8_0 V cache requires `--flash-attn enabled`. Logs and
