@@ -5754,6 +5754,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
     }
+    if (strcmp(name, "ggml_backend_get_d2f_parallel_activation_count") == 0) {
+        return (void *)ggml_backend_cuda_get_d2f_parallel_activation_count;
+    }
     if (strcmp(name, "ggml_backend_cuda_get_d2f_parallel_activation_count") == 0) {
         return (void *)ggml_backend_cuda_get_d2f_parallel_activation_count;
     }

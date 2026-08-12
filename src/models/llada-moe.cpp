@@ -73,6 +73,15 @@ llama_model_llada_moe::graph::graph(const llama_model & model, const llm_graph_p
     for (int il = 0; il < n_layer; ++il) {
         ggml_tensor * inpSA = inpL;
 
+        // The Vulkan graph optimizer may pull this independent final-layer
+        // residual slice forward. Expand it before constructing attention so
+        // it cannot be interleaved with a packed Flash Attention region whose
+        // branches are delayed until their concat join.
+        if (il == n_layer - 1 && inp_out_ids) {
+            inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
+            ggml_build_forward_expand(gf, inpSA);
+        }
+
         // norm
         cur = build_norm(inpL,
                 model.layers[il].attn_norm, NULL,
@@ -116,8 +125,7 @@ llama_model_llada_moe::graph::graph(const llama_model & model, const llm_graph_p
                             Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
         }
         if (il == n_layer - 1 && inp_out_ids) {
-            cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
-            inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
+            cur = ggml_get_rows(ctx0, cur, inp_out_ids);
         }
         ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
         cb(ffn_inp, "ffn_inp", il);

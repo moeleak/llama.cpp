@@ -1,4 +1,5 @@
 #include "ggml-vulkan.h"
+#include "ggml-vulkan-d2f.h"
 #include <vulkan/vulkan_core.h>
 #if defined(GGML_VULKAN_RUN_TESTS) || defined(GGML_VULKAN_CHECK_RESULTS)
 #include <chrono>
@@ -49,7 +50,10 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #endif
 
 #include <algorithm>
+#include <atomic>
+#include <cerrno>
 #include <cmath>
+#include <cstdlib>
 #include <iomanip>
 #include <iostream>
 #include <tuple>
@@ -331,6 +335,7 @@ struct vk_queue_handle_unsynchronized : vk_queue_handle {
 
 struct vk_queue {
     uint32_t queue_family_index;
+    uint32_t queue_index;
     std::shared_ptr<vk_queue_handle> handle;
 
     vk_command_pool cmd_pool;
@@ -745,7 +750,13 @@ struct vk_device_struct {
     vk::DriverId driver_id;
     vk_device_architecture architecture;
     std::unique_ptr<vk_queue> compute_queue;
+    std::vector<std::unique_ptr<vk_queue>> compute_worker_queues;
     std::unique_ptr<vk_queue> transfer_queue;
+    uint32_t compute_queue_count {1};
+    uint32_t compute_queue_family_index {};
+    uint32_t transfer_queue_family_index {};
+    bool timeline_semaphore {};
+    bool transfer_queue_same_family {};
     bool single_queue;
     bool support_async;
     bool async_use_transfer_queue;
@@ -1048,16 +1059,24 @@ struct vk_device_struct {
     ~vk_device_struct() {
         VK_LOG_DEBUG("destroy device " << name);
 
+        if (!device) {
+            return;
+        }
+
         device.destroyFence(fence);
 
         ggml_vk_destroy_buffer(sync_staging);
 
         if (compute_queue) compute_queue->cmd_pool.destroy(device);
+        for (auto & queue : compute_worker_queues) {
+            queue->cmd_pool.destroy(device);
+        }
         if (transfer_queue) transfer_queue->cmd_pool.destroy(device);
 
         // Explicitly clear to ensure queues drop their shared_ptrs to handles
         // before the Vulkan logical device instance is destroyed
         compute_queue.reset();
+        compute_worker_queues.clear();
         transfer_queue.reset();
 
         for (auto& pipeline : all_pipelines) {
@@ -1087,6 +1106,9 @@ void vk_command_pool::init(vk_device& device, vk_queue *q_) {
 }
 
 void vk_command_pool::destroy(vk::Device& device) {
+    if (!pool) {
+        return;
+    }
     device.destroyCommandPool(pool);
     pool = nullptr;
     cmd_buffers.clear();
@@ -2196,6 +2218,7 @@ struct ggml_backend_vk_context {
     bool prealloc_x_need_sync, prealloc_y_need_sync, prealloc_split_k_need_sync;
 
     vk_context_ref compute_ctx;
+    std::vector<vk_context_ref> compute_worker_ctxs;
 
     vk_context_ref transfer_ctx;
     vk_semaphore transfer_semaphore;
@@ -2209,7 +2232,16 @@ struct ggml_backend_vk_context {
     uint32_t pipeline_descriptor_set_requirements {};
 
     vk_command_pool compute_cmd_pool;
+    std::vector<vk_command_pool> compute_worker_cmd_pools;
+    std::vector<vk::Fence> compute_worker_cleanup_fences;
+    std::vector<uint8_t> compute_worker_submit_pending;
+    std::vector<uint64_t> compute_worker_transfer_semaphore_last_submitted;
     vk_command_pool transfer_cmd_pool;
+
+    vk_semaphore d2f_fork_semaphore;
+    std::vector<vk_semaphore> d2f_worker_done_semaphores;
+    std::atomic<uint64_t> d2f_parallel_activation_count {0};
+    bool d2f_parallel_activation_logged {};
 
     // number of additional consecutive nodes that are being fused with the
     // node currently being processed
@@ -3067,12 +3099,36 @@ static uint32_t ggml_vk_find_queue_family_index(std::vector<vk::QueueFamilyPrope
     abort();
 }
 
+static uint32_t ggml_vk_d2f_compute_queue_request() {
+    // Multi-queue execution is opt-in until a device-specific quality,
+    // stability, and latency gate has passed. Some mobile drivers expose
+    // multiple logical queues but lose the device under a large packed graph.
+    static constexpr uint32_t default_queue_count = 1;
+    static constexpr uint32_t max_queue_count = 8;
+
+    const char * value = getenv("GGML_VK_D2F_COMPUTE_QUEUES");
+    if (value == nullptr || value[0] == '\0') {
+        return default_queue_count;
+    }
+
+    errno = 0;
+    char * end = nullptr;
+    const unsigned long parsed = std::strtoul(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' || value[0] == '-') {
+        GGML_LOG_WARN("ggml_vulkan: invalid GGML_VK_D2F_COMPUTE_QUEUES='%s'; using %u\n", value, default_queue_count);
+        return default_queue_count;
+    }
+
+    return std::max(1u, std::min(max_queue_count, static_cast<uint32_t>(std::min<unsigned long>(parsed, max_queue_count))));
+}
+
 static std::unique_ptr<vk_queue> ggml_vk_create_queue(vk_device& device, uint32_t queue_family_index, uint32_t queue_index, vk::PipelineStageFlags&& stage_flags, bool transfer_only) {
     VK_LOG_DEBUG("ggml_vk_create_queue()");
     std::lock_guard<std::recursive_mutex> guard(device->mutex);
 
     auto q = std::make_unique<vk_queue>();
     q->queue_family_index = queue_family_index;
+    q->queue_index = queue_index;
     q->transfer_only = transfer_only;
 
     std::shared_ptr<vk_queue_handle> h;
@@ -3101,10 +3157,19 @@ static std::unique_ptr<vk_queue> ggml_vk_create_aliased_queue(vk_device& device,
     auto q = std::make_unique<vk_queue>();
     q->handle = source->handle;
     q->queue_family_index = source->queue_family_index;
+    q->queue_index = source->queue_index;
     q->stage_flags = source->stage_flags;
     q->transfer_only = source->transfer_only;
     q->cmd_pool.init(device, q.get());
     return q;
+}
+
+static vk_queue * ggml_vk_get_compute_queue(vk_device & device, uint32_t queue_index) {
+    GGML_ASSERT(queue_index < device->compute_queue_count);
+    if (queue_index == 0) {
+        return device->compute_queue.get();
+    }
+    return device->compute_worker_queues[queue_index - 1].get();
 }
 
 static vk_context ggml_vk_create_context(ggml_backend_vk_context * ctx, vk_command_pool& p) {
@@ -3154,6 +3219,10 @@ static vk::Event ggml_vk_create_event(ggml_backend_vk_context * ctx) {
 static void ggml_vk_command_pool_cleanup(vk_device& device, vk_command_pool& p) {
     VK_LOG_DEBUG("ggml_vk_command_pool_cleanup()");
 
+    if (!p.pool) {
+        return;
+    }
+
     // Requires command buffers to be done
     device->device.resetCommandPool(p.pool);
     // Don't clear the command buffers and mark them as not in use.
@@ -3171,6 +3240,11 @@ static void ggml_vk_queue_command_pools_cleanup(vk_device& device) {
 
     if (device->compute_queue->cmd_pool.buffers_in_use() >= cleanup_frequency) {
         ggml_vk_command_pool_cleanup(device, device->compute_queue->cmd_pool);
+    }
+    for (auto & queue : device->compute_worker_queues) {
+        if (queue->cmd_pool.buffers_in_use() >= cleanup_frequency) {
+            ggml_vk_command_pool_cleanup(device, queue->cmd_pool);
+        }
     }
     if (device->transfer_queue->cmd_pool.buffers_in_use() >= cleanup_frequency) {
         ggml_vk_command_pool_cleanup(device, device->transfer_queue->cmd_pool);
@@ -5909,6 +5983,17 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 static bool ggml_vk_khr_cooperative_matrix_support(const vk::PhysicalDeviceProperties& props, const vk::PhysicalDeviceDriverProperties& driver_props, vk_device_architecture arch);
 static uint32_t ggml_vk_intel_shader_core_count(const vk::PhysicalDevice& vkdev);
 
+struct vk_device_cache_init_guard {
+    vk_device * slot;
+    bool committed {};
+
+    ~vk_device_cache_init_guard() {
+        if (!committed) {
+            slot->reset();
+        }
+    }
+};
+
 static vk_device ggml_vk_get_device(size_t idx) {
     VK_LOG_DEBUG("ggml_vk_get_device(" << idx << ")");
 
@@ -5916,6 +6001,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
         VK_LOG_DEBUG("Initializing new vk_device");
         vk_device device = std::make_shared<vk_device_struct>();
         vk_instance.devices[idx] = device;
+        vk_device_cache_init_guard cache_guard { &vk_instance.devices[idx] };
 
         device->memory_logger = std::unique_ptr<vk_memory_logger>(new vk_memory_logger());
 
@@ -6210,7 +6296,22 @@ static vk_device ggml_vk_get_device(size_t idx) {
         const uint32_t compute_queue_family_index = ggml_vk_find_queue_family_index(queue_family_props, vk::QueueFlagBits::eCompute, graphics_flag, -1, 1);
         const uint32_t transfer_queue_family_index = ggml_vk_find_queue_family_index(queue_family_props, vk::QueueFlagBits::eTransfer, vk::QueueFlagBits::eCompute | graphics_flag, compute_queue_family_index, 1);
 
-        const float priorities[] = { 1.0f, 1.0f };
+        const uint32_t requested_compute_queue_count = ggml_vk_d2f_compute_queue_request();
+        uint32_t compute_queue_count = std::min(requested_compute_queue_count, queue_family_props[compute_queue_family_index].queueCount);
+        const bool transfer_queue_same_family = compute_queue_family_index == transfer_queue_family_index;
+        const bool prefers_transfer_queue =
+            device->vendor_id == VK_VENDOR_ID_AMD &&
+            device->architecture != AMD_GCN &&
+            !device->uma &&
+            !allow_graphics_queue;
+        const bool async_transfer_queue_requested = prefers_transfer_queue || (getenv("GGML_VK_ASYNC_USE_TRANSFER_QUEUE") != nullptr);
+
+        std::array<float, 9> priorities;
+        priorities.fill(1.0f);
+
+        device->compute_queue_family_index = compute_queue_family_index;
+        device->transfer_queue_family_index = transfer_queue_family_index;
+        device->transfer_queue_same_family = transfer_queue_same_family;
         device->single_queue = compute_queue_family_index == transfer_queue_family_index && queue_family_props[compute_queue_family_index].queueCount == 1;
 
         std::vector<vk::DeviceQueueCreateInfo> device_queue_create_infos;
@@ -6385,6 +6486,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
         vkGetPhysicalDeviceFeatures2(device->physical_device, &device_features2);
 
         device->has_internally_synchronized_queues = internally_synchronized_queues_features.internallySynchronizedQueues;
+        device->timeline_semaphore = vk12_features.timelineSemaphore;
 
         // Build queue create infos only after querying whether internally synchronized queues are enabled.
         // getQueue2() later uses the same flag, so creation/retrieval must stay consistent.
@@ -6392,13 +6494,28 @@ static vk_device ggml_vk_get_device(size_t idx) {
                                                 eInternallySynchronizedKHR :
                                                 vk::DeviceQueueCreateFlags();
 
-        if (compute_queue_family_index != transfer_queue_family_index) {
-            device_queue_create_infos.push_back({queue_flags, compute_queue_family_index, 1, priorities});
-            device_queue_create_infos.push_back({queue_flags, transfer_queue_family_index, 1, priorities + 1});
-        } else if(!device->single_queue) {
-            device_queue_create_infos.push_back({queue_flags, compute_queue_family_index, 2, priorities});
+        const bool async_transfer_queue_enabled = async_transfer_queue_requested && device->timeline_semaphore;
+        const ggml_vk_d2f::compute_queue_plan queue_plan = ggml_vk_d2f::plan_compute_queues(
+            requested_compute_queue_count,
+            queue_family_props[compute_queue_family_index].queueCount,
+            transfer_queue_same_family,
+            async_transfer_queue_enabled);
+        compute_queue_count = queue_plan.compute_queue_count;
+        const bool reserve_same_family_transfer_queue = queue_plan.reserve_transfer_queue;
+        device->compute_queue_count = compute_queue_count;
+
+        if (!transfer_queue_same_family) {
+            device_queue_create_infos.push_back({queue_flags, compute_queue_family_index, compute_queue_count, priorities.data()});
+            device_queue_create_infos.push_back({queue_flags, transfer_queue_family_index, 1, priorities.data() + compute_queue_count});
         } else {
-            device_queue_create_infos.push_back({queue_flags, compute_queue_family_index, 1, priorities});
+            const uint32_t queue_count = compute_queue_count + (reserve_same_family_transfer_queue ? 1u : 0u);
+            device_queue_create_infos.push_back({queue_flags, compute_queue_family_index, queue_count, priorities.data()});
+        }
+
+        if (async_transfer_queue_requested && !device->timeline_semaphore) {
+            GGML_LOG_WARN("ggml_vulkan: async transfer queue requested, but timelineSemaphore is unavailable; aliasing compute queue 0 when families match\n");
+        } else if (transfer_queue_same_family && async_transfer_queue_enabled && !reserve_same_family_transfer_queue) {
+            GGML_LOG_WARN("ggml_vulkan: async transfer queue requested, but compute family %u has no unreserved queue; aliasing compute queue 0\n", compute_queue_family_index);
         }
 
         device->pipeline_executable_properties_support = pipeline_executable_properties_support;
@@ -6686,6 +6803,15 @@ static vk_device ggml_vk_get_device(size_t idx) {
 
         // Queues
         device->compute_queue = ggml_vk_create_queue(device, compute_queue_family_index, 0, { vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer }, false);
+        device->compute_worker_queues.reserve(compute_queue_count - 1);
+        for (uint32_t queue_index = 1; queue_index < compute_queue_count; ++queue_index) {
+            device->compute_worker_queues.push_back(ggml_vk_create_queue(
+                device,
+                compute_queue_family_index,
+                queue_index,
+                { vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer },
+                false));
+        }
 
         // Shaders
         // Disable matmul tile sizes early if performance low or not supported
@@ -6778,31 +6904,34 @@ static vk_device ggml_vk_get_device(size_t idx) {
 
         ggml_vk_load_shaders(device);
 
-        // Prefer a dedicated transfer queue on AMD dGPUs (non-GCN) when graphics queue use is disabled.
-        const bool prefers_transfer_queue =
-            device->vendor_id == VK_VENDOR_ID_AMD &&
-            device->architecture != AMD_GCN &&
-            !device->uma &&
-            !allow_graphics_queue;
-
-        if (!device->single_queue) {
-            const uint32_t transfer_queue_index = compute_queue_family_index == transfer_queue_family_index ? 1 : 0;
-            device->transfer_queue = ggml_vk_create_queue(device, transfer_queue_family_index, transfer_queue_index, { vk::PipelineStageFlagBits::eTransfer }, true);
-
-            device->async_use_transfer_queue = prefers_transfer_queue || (getenv("GGML_VK_ASYNC_USE_TRANSFER_QUEUE") != nullptr);
+        if (!transfer_queue_same_family) {
+            device->transfer_queue = ggml_vk_create_queue(device, transfer_queue_family_index, 0, { vk::PipelineStageFlagBits::eTransfer }, true);
+            device->async_use_transfer_queue = async_transfer_queue_enabled;
+        } else if (reserve_same_family_transfer_queue) {
+            device->transfer_queue = ggml_vk_create_queue(device, transfer_queue_family_index, compute_queue_count, { vk::PipelineStageFlagBits::eTransfer }, true);
+            device->async_use_transfer_queue = true;
         } else {
             device->transfer_queue = ggml_vk_create_aliased_queue(device, device->compute_queue);
-
             device->async_use_transfer_queue = false;
         }
+
+        GGML_LOG_INFO(
+            "ggml_vulkan: %s: D2F compute queues requested=%u actual=%u family=%u timelineSemaphore=%s transfer_family=%u transfer_queue=%s\n",
+            device->properties.deviceName.data(),
+            requested_compute_queue_count,
+            compute_queue_count,
+            compute_queue_family_index,
+            device->timeline_semaphore ? "true" : "false",
+            transfer_queue_family_index,
+            device->async_use_transfer_queue ? (transfer_queue_same_family ? "async-same-family" : "async-different-family") : "queue-0-alias-or-disabled");
+
+        device->fence = device->device.createFence({});
 
         device->buffer_type = {
             /* .iface    = */ ggml_backend_vk_buffer_type_interface,
             /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_vk_reg(), idx),
             /* .context  = */ new ggml_backend_vk_buffer_type_context{ device->name, device },
         };
-
-        device->fence = device->device.createFence({});
 
         device->idx = idx;
 
@@ -6821,6 +6950,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
             device->mmvq_mode = 1;
         }
 
+        cache_guard.committed = true;
         return device;
     }
 
@@ -7355,6 +7485,28 @@ static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
     ctx->almost_ready_fence = ctx->device->device.createFence({});
 
     ctx->compute_cmd_pool.init(ctx->device, ctx->device->compute_queue.get());
+    const size_t compute_worker_count = ctx->device->compute_queue_count - 1;
+    ctx->compute_worker_ctxs.resize(compute_worker_count);
+    ctx->compute_worker_cmd_pools.resize(compute_worker_count);
+    ctx->compute_worker_cleanup_fences.resize(compute_worker_count);
+    ctx->compute_worker_submit_pending.resize(compute_worker_count);
+    ctx->compute_worker_transfer_semaphore_last_submitted.resize(compute_worker_count);
+    for (size_t worker_index = 0; worker_index < compute_worker_count; ++worker_index) {
+        ctx->compute_worker_cmd_pools[worker_index].init(ctx->device, ctx->device->compute_worker_queues[worker_index].get());
+        ctx->compute_worker_cleanup_fences[worker_index] = ctx->device->device.createFence({});
+    }
+
+    if (compute_worker_count > 0 && ctx->device->timeline_semaphore) {
+        vk::SemaphoreTypeCreateInfo tci{ vk::SemaphoreType::eTimeline, 0 };
+        vk::SemaphoreCreateInfo ci{};
+        ci.setPNext(&tci);
+        ctx->d2f_fork_semaphore = { ctx->device->device.createSemaphore(ci), 0 };
+        ctx->d2f_worker_done_semaphores.resize(compute_worker_count);
+        for (auto & semaphore : ctx->d2f_worker_done_semaphores) {
+            semaphore = { ctx->device->device.createSemaphore(ci), 0 };
+        }
+    }
+
     if (ctx->device->async_use_transfer_queue) {
         vk::SemaphoreTypeCreateInfo tci{ vk::SemaphoreType::eTimeline, 0 };
         vk::SemaphoreCreateInfo ci{};
@@ -7934,23 +8086,114 @@ static void ggml_vk_ctx_begin(vk_device& device, vk_context& subctx) {
     subctx->s = subctx->seqs[subctx->seqs.size() - 1].data();
 }
 
-static vk_context ggml_vk_get_compute_ctx(ggml_backend_vk_context * ctx) {
-    vk_context result;
-    if (!ctx->compute_ctx.expired()) {
-        result = ctx->compute_ctx.lock();
-    } else {
-        result = ggml_vk_create_context(ctx, ctx->compute_cmd_pool);
+static uint32_t ggml_vk_compute_queue_count(const ggml_backend_vk_context * ctx) {
+    return ctx->device->compute_queue_count;
+}
 
-        ctx->compute_ctx = result;
+static vk_context_ref & ggml_vk_compute_ctx_ref(ggml_backend_vk_context * ctx, uint32_t queue_index) {
+    GGML_ASSERT(queue_index < ggml_vk_compute_queue_count(ctx));
+    if (queue_index == 0) {
+        return ctx->compute_ctx;
+    }
+    return ctx->compute_worker_ctxs[queue_index - 1];
+}
+
+static vk_command_pool & ggml_vk_compute_cmd_pool(ggml_backend_vk_context * ctx, uint32_t queue_index) {
+    GGML_ASSERT(queue_index < ggml_vk_compute_queue_count(ctx));
+    if (queue_index == 0) {
+        return ctx->compute_cmd_pool;
+    }
+    return ctx->compute_worker_cmd_pools[queue_index - 1];
+}
+
+static vk_queue * ggml_vk_compute_queue(ggml_backend_vk_context * ctx, uint32_t queue_index) {
+    return ggml_vk_get_compute_queue(ctx->device, queue_index);
+}
+
+static vk_context ggml_vk_get_compute_ctx(ggml_backend_vk_context * ctx, uint32_t queue_index = 0) {
+    vk_context_ref & context_ref = ggml_vk_compute_ctx_ref(ctx, queue_index);
+    vk_context result;
+    if (!context_ref.expired()) {
+        result = context_ref.lock();
+    } else {
+        result = ggml_vk_create_context(ctx, ggml_vk_compute_cmd_pool(ctx, queue_index));
+
+        context_ref = result;
         ggml_vk_ctx_begin(ctx->device, result);
     }
 
-    if (ctx->device->async_use_transfer_queue && ctx->transfer_semaphore_last_submitted < ctx->transfer_semaphore.value) {
+    uint64_t & transfer_semaphore_last_submitted = queue_index == 0 ?
+        ctx->transfer_semaphore_last_submitted :
+        ctx->compute_worker_transfer_semaphore_last_submitted[queue_index - 1];
+    if (ctx->device->async_use_transfer_queue && transfer_semaphore_last_submitted < ctx->transfer_semaphore.value) {
         result->s->wait_semaphores.push_back(ctx->transfer_semaphore);
-        ctx->transfer_semaphore_last_submitted = ctx->transfer_semaphore.value;
+        transfer_semaphore_last_submitted = ctx->transfer_semaphore.value;
     }
 
     return result;
+}
+
+static bool ggml_vk_submit_compute_ctx(
+        ggml_backend_vk_context * ctx,
+        uint32_t queue_index,
+        const std::vector<vk_semaphore> & wait_semaphores = {},
+        const std::vector<vk_semaphore> & signal_semaphores = {}) {
+    vk_context_ref & context_ref = ggml_vk_compute_ctx_ref(ctx, queue_index);
+    if (context_ref.expired()) {
+        return false;
+    }
+
+    vk_context compute_ctx = context_ref.lock();
+    GGML_ASSERT(compute_ctx->s != nullptr);
+    compute_ctx->s->wait_semaphores.insert(
+        compute_ctx->s->wait_semaphores.end(),
+        wait_semaphores.begin(),
+        wait_semaphores.end());
+    compute_ctx->s->signal_semaphores.insert(
+        compute_ctx->s->signal_semaphores.end(),
+        signal_semaphores.begin(),
+        signal_semaphores.end());
+    ggml_vk_ctx_end(compute_ctx);
+
+    for (auto & cpy : compute_ctx->in_memcpys) {
+        memcpy(cpy.dst, cpy.src, cpy.n);
+    }
+    for (auto & mset : compute_ctx->memsets) {
+        memset(mset.dst, mset.val, mset.n);
+    }
+    GGML_ASSERT(compute_ctx->out_memcpys.empty());
+
+    ggml_vk_submit(compute_ctx, {});
+    context_ref.reset();
+    if (queue_index == 0) {
+        ctx->submit_pending = true;
+    } else {
+        ctx->compute_worker_submit_pending[queue_index - 1] = true;
+    }
+    return true;
+}
+
+static void ggml_vk_discard_compute_ctx(ggml_backend_vk_context * ctx, uint32_t queue_index) {
+    ggml_vk_compute_ctx_ref(ctx, queue_index).reset();
+}
+
+static void ggml_vk_wait_compute_worker_submissions(ggml_backend_vk_context * ctx) {
+    std::vector<vk::Fence> fences;
+    for (size_t worker_index = 0; worker_index < ctx->compute_worker_submit_pending.size(); ++worker_index) {
+        if (!ctx->compute_worker_submit_pending[worker_index]) {
+            continue;
+        }
+
+        vk::Fence fence = ctx->compute_worker_cleanup_fences[worker_index];
+        ctx->device->device.resetFences({ fence });
+        ggml_vk_compute_queue(ctx, static_cast<uint32_t>(worker_index + 1))->handle->submit({}, fence);
+        fences.push_back(fence);
+    }
+
+    if (!fences.empty()) {
+        VK_CHECK(ctx->device->device.waitForFences(fences, true, UINT64_MAX), "ggml_vk_wait_compute_worker_submissions");
+    }
+    std::fill(ctx->compute_worker_submit_pending.begin(), ctx->compute_worker_submit_pending.end(), 0);
 }
 
 static vk_context ggml_vk_get_transfer_ctx(ggml_backend_vk_context * ctx) {
@@ -10485,7 +10728,7 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
     return supported;
 }
 
-static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
+static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst, bool force_no_split_k = false) {
     VK_LOG_DEBUG("ggml_vk_flash_attn((" << q << ", name=" << q->name << ", type=" << q->type << ", ne0=" << q->ne[0] << ", ne1=" << q->ne[1] << ", ne2=" << q->ne[2] << ", ne3=" << q->ne[3] << ", nb0=" << q->nb[0] << ", nb1=" << q->nb[1] << ", nb2=" << q->nb[2] << ", nb3=" << q->nb[3];
     std::cerr << "), (" << k << ", name=" << k->name << ", type=" << k->type << ", ne0=" << k->ne[0] << ", ne1=" << k->ne[1] << ", ne2=" << k->ne[2] << ", ne3=" << k->ne[3] << ", nb0=" << k->nb[0] << ", nb1=" << k->nb[1] << ", nb2=" << k->nb[2] << ", nb3=" << k->nb[3];
     std::cerr << "), (" << v << ", name=" << v->name << ", type=" << v->type << ", ne0=" << v->ne[0] << ", ne1=" << v->ne[1] << ", ne2=" << v->ne[2] << ", ne3=" << v->ne[3] << ", nb0=" << v->nb[0] << ", nb1=" << v->nb[1] << ", nb2=" << v->nb[2] << ", nb3=" << v->nb[3];
@@ -10633,21 +10876,23 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     GGML_ASSERT(Br == pipeline->wg_denoms[0]);
     const uint32_t Tr = CEIL_DIV(N, Br);
 
-    // Try to use split_k when KV is large enough to be worth the overhead.
-    if (gqa_ratio > 1 && workgroups_x <= Br) {
-        split_k = shader_core_count * 2 / (workgroups_x * workgroups_y * workgroups_z);
-    } else if (gqa_ratio <= 1) {
-        uint32_t total_wgs_no_split = Tr * workgroups_y * workgroups_z;
-        if (total_wgs_no_split < shader_core_count * 2) {
-            split_k = shader_core_count * 2 / total_wgs_no_split;
+    if (!force_no_split_k) {
+        // Try to use split_k when KV is large enough to be worth the overhead.
+        if (gqa_ratio > 1 && workgroups_x <= Br) {
+            split_k = shader_core_count * 2 / (workgroups_x * workgroups_y * workgroups_z);
+        } else if (gqa_ratio <= 1) {
+            uint32_t total_wgs_no_split = Tr * workgroups_y * workgroups_z;
+            if (total_wgs_no_split < shader_core_count * 2) {
+                split_k = shader_core_count * 2 / total_wgs_no_split;
+            }
         }
-    }
 
-    if (split_k > 1) {
-        // Try to evenly split KV into split_k chunks, but it needs to be a multiple
-        // of "align", so recompute split_k based on that.
-        split_kv = ROUNDUP_POW2(std::max(1u, KV / split_k), alignment);
-        split_k = CEIL_DIV(KV, split_kv);
+        if (split_k > 1) {
+            // Try to evenly split KV into split_k chunks, but it needs to be a multiple
+            // of "align", so recompute split_k based on that.
+            split_kv = ROUNDUP_POW2(std::max(1u, KV / split_k), alignment);
+            split_k = CEIL_DIV(KV, split_kv);
+        }
     }
 
     // Reserve space for split_k temporaries. For each split x batch, we need to store the O matrix (D x ne1)
@@ -15386,6 +15631,12 @@ static void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
     ctx->prealloc_x_need_sync = ctx->prealloc_y_need_sync = ctx->prealloc_split_k_need_sync = false;
 
     ggml_vk_command_pool_cleanup(ctx->device, ctx->compute_cmd_pool);
+    for (auto & context_ref : ctx->compute_worker_ctxs) {
+        context_ref.reset();
+    }
+    for (auto & command_pool : ctx->compute_worker_cmd_pools) {
+        ggml_vk_command_pool_cleanup(ctx->device, command_pool);
+    }
     if (ctx->device->async_use_transfer_queue) {
         ggml_vk_command_pool_cleanup(ctx->device, ctx->transfer_cmd_pool);
     }
@@ -15418,6 +15669,9 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     VK_LOG_DEBUG("ggml_vk_cleanup(" << ctx->name << ")");
     // discard any unsubmitted command buffers
     ctx->compute_ctx.reset();
+    for (auto & context_ref : ctx->compute_worker_ctxs) {
+        context_ref.reset();
+    }
     // wait for any pending command buffers to finish
     ggml_vk_synchronize(ctx);
 
@@ -15442,8 +15696,18 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     }
     ctx->gc.events.clear();
 
-    ctx->device->device.destroyFence(ctx->fence);
-    ctx->device->device.destroyFence(ctx->almost_ready_fence);
+    if (ctx->fence) {
+        ctx->device->device.destroyFence(ctx->fence);
+    }
+    if (ctx->almost_ready_fence) {
+        ctx->device->device.destroyFence(ctx->almost_ready_fence);
+    }
+    for (auto & fence : ctx->compute_worker_cleanup_fences) {
+        if (fence) {
+            ctx->device->device.destroyFence(fence);
+        }
+    }
+    ctx->compute_worker_cleanup_fences.clear();
 
     for (auto& pool : ctx->descriptor_pools) {
         ctx->device->device.destroyDescriptorPool(pool);
@@ -15452,12 +15716,33 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     ctx->descriptor_sets.clear();
 
     ctx->compute_cmd_pool.destroy(ctx->device->device);
+    for (auto & command_pool : ctx->compute_worker_cmd_pools) {
+        command_pool.destroy(ctx->device->device);
+    }
+    ctx->compute_worker_cmd_pools.clear();
+    ctx->compute_worker_ctxs.clear();
+    ctx->compute_worker_submit_pending.clear();
+    ctx->compute_worker_transfer_semaphore_last_submitted.clear();
+
+    if (ctx->d2f_fork_semaphore.s) {
+        ctx->device->device.destroySemaphore(ctx->d2f_fork_semaphore.s);
+        ctx->d2f_fork_semaphore = {};
+    }
+    for (auto & semaphore : ctx->d2f_worker_done_semaphores) {
+        if (semaphore.s) {
+            ctx->device->device.destroySemaphore(semaphore.s);
+        }
+    }
+    ctx->d2f_worker_done_semaphores.clear();
+
     if (ctx->device->async_use_transfer_queue) {
-        ctx->device->device.destroySemaphore(ctx->transfer_semaphore.s);
+        if (ctx->transfer_semaphore.s) {
+            ctx->device->device.destroySemaphore(ctx->transfer_semaphore.s);
+        }
 
         ctx->transfer_cmd_pool.destroy(ctx->device->device);
     }
-    if (vk_perf_logger_enabled) {
+    if (ctx->perf_logger) {
         ctx->perf_logger->print_timings(true);
     }
 }
@@ -15993,6 +16278,8 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
             cmd_buf->buf.reset();
         }
     }
+
+    ggml_vk_wait_compute_worker_submissions(ctx);
 
     if (do_transfer) {
         for (auto& cpy : compute_ctx->out_memcpys) {
@@ -16538,6 +16825,250 @@ static int32_t find_first_set(uint32_t x) {
     return ret;
 }
 
+struct ggml_vk_d2f_parallel_graph {
+    ggml_vk_d2f::packed_attention_parse_result parsed;
+    std::vector<int> region_for_join;
+    std::vector<uint8_t> skip_node;
+    bool enabled {};
+    const char * disabled_reason {};
+};
+
+static bool ggml_vk_d2f_tensor_on_device(
+        const ggml_backend_vk_context * ctx,
+        const ggml_tensor * tensor,
+        bool require_compute) {
+    if (tensor == nullptr || tensor->buffer == nullptr ||
+        !ggml_backend_buffer_is_vk(tensor->buffer)) {
+        return false;
+    }
+    if (require_compute && (tensor->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+        return false;
+    }
+
+    const auto * buffer_ctx =
+        static_cast<const ggml_backend_vk_buffer_context *>(tensor->buffer->context);
+    return buffer_ctx != nullptr && buffer_ctx->dev_buffer != nullptr &&
+        buffer_ctx->dev_buffer->device == ctx->device;
+}
+
+static ggml_vk_d2f_parallel_graph ggml_vk_prepare_d2f_parallel_graph(
+        ggml_backend_vk_context * ctx,
+        ggml_cgraph * cgraph) {
+    ggml_vk_d2f_parallel_graph result;
+    result.parsed = ggml_vk_d2f::parse_packed_attention_graph(cgraph);
+    if (result.parsed.status == ggml_vk_d2f::packed_attention_parse_status::absent) {
+        return result;
+    }
+    if (result.parsed.status == ggml_vk_d2f::packed_attention_parse_status::rejected) {
+        GGML_LOG_WARN(
+            "D2F Vulkan parallel Flash Attention rejected: layer=%d reason=%s\n",
+            result.parsed.rejected_layer,
+            result.parsed.reason.c_str());
+        result.disabled_reason = "packed graph validation failed";
+        return result;
+    }
+
+#if defined(GGML_VULKAN_CHECK_RESULTS)
+    result.disabled_reason = "result checking is enabled";
+    return result;
+#endif
+    if (vk_perf_logger_enabled) {
+        result.disabled_reason = "performance logging is enabled";
+        return result;
+    }
+    if (!ctx->device->support_async) {
+        result.disabled_reason = "asynchronous execution is disabled";
+        return result;
+    }
+    if (!ctx->device->timeline_semaphore) {
+        result.disabled_reason = "timeline semaphores are unavailable";
+        return result;
+    }
+    if (ggml_vk_compute_queue_count(ctx) < 2) {
+        result.disabled_reason = "the compute family exposes fewer than two requested queues";
+        return result;
+    }
+    if (ctx->device->async_use_transfer_queue && !ctx->device->transfer_queue_same_family) {
+        result.disabled_reason = "an asynchronous transfer queue uses a different family";
+        return result;
+    }
+    if (!ctx->d2f_fork_semaphore.s || ctx->d2f_worker_done_semaphores.empty()) {
+        result.disabled_reason = "parallel synchronization objects are unavailable";
+        return result;
+    }
+
+    for (const auto & region : result.parsed.regions) {
+        for (const ggml_tensor * concat : region.concat_postorder) {
+            if (!ggml_vk_d2f_tensor_on_device(ctx, concat, true) ||
+                !ggml_vk_d2f_tensor_on_device(ctx, concat->src[0], false) ||
+                !ggml_vk_d2f_tensor_on_device(ctx, concat->src[1], false)) {
+                result.disabled_reason = "a concat tensor is not compute-resident on this Vulkan device";
+                return result;
+            }
+            if (ggml_vk_tensors_overlap(concat, concat->src[0], false) ||
+                ggml_vk_tensors_overlap(concat, concat->src[1], false)) {
+                result.disabled_reason = "a concat output aliases one of its inputs";
+                return result;
+            }
+        }
+
+        for (const auto & lane : region.lanes) {
+            const ggml_tensor * flash = lane.flash_attn;
+            if (!ggml_vk_d2f_tensor_on_device(ctx, flash, true) ||
+                !ggml_vk_d2f_tensor_on_device(ctx, flash->src[0], false) ||
+                !ggml_vk_d2f_tensor_on_device(ctx, flash->src[1], false) ||
+                !ggml_vk_d2f_tensor_on_device(ctx, flash->src[2], false) ||
+                (flash->src[4] != nullptr &&
+                 !ggml_vk_d2f_tensor_on_device(ctx, flash->src[4], false))) {
+                result.disabled_reason = "a Flash Attention tensor is not compute-resident on this Vulkan device";
+                return result;
+            }
+        }
+
+        for (size_t lhs = 0; lhs < region.lanes.size(); ++lhs) {
+            const ggml_tensor * lhs_output = region.lanes[lhs].flash_attn;
+            for (size_t rhs = lhs + 1; rhs < region.lanes.size(); ++rhs) {
+                const ggml_tensor * rhs_output = region.lanes[rhs].flash_attn;
+                if (ggml_vk_tensors_overlap(lhs_output, rhs_output, false)) {
+                    result.disabled_reason = "packed lane output buffers overlap";
+                    return result;
+                }
+            }
+
+            for (const auto & input_lane : region.lanes) {
+                const ggml_tensor * input_flash = input_lane.flash_attn;
+                const int input_indices[] = { 0, 1, 2, 4 };
+                for (int input_index : input_indices) {
+                    const ggml_tensor * input = input_flash->src[input_index];
+                    if (input != nullptr && ggml_vk_tensors_overlap(lhs_output, input, false)) {
+                        result.disabled_reason = "a packed lane output aliases a concurrent lane input";
+                        return result;
+                    }
+                }
+            }
+        }
+    }
+
+    result.region_for_join.assign(cgraph->n_nodes, -1);
+    result.skip_node.assign(cgraph->n_nodes, 0);
+    std::unordered_map<const ggml_tensor *, int> node_indices;
+    node_indices.reserve(cgraph->n_nodes);
+    for (int index = 0; index < cgraph->n_nodes; ++index) {
+        node_indices.emplace(cgraph->nodes[index], index);
+    }
+    for (size_t region_index = 0; region_index < result.parsed.regions.size(); ++region_index) {
+        const auto & region = result.parsed.regions[region_index];
+        result.region_for_join[region.join_node_index] = static_cast<int>(region_index);
+        for (const auto & lane : region.lanes) {
+            result.skip_node[lane.flash_node_index] = 1;
+        }
+        for (const ggml_tensor * concat : region.concat_postorder) {
+            const auto index = node_indices.find(concat);
+            GGML_ASSERT(index != node_indices.end());
+            result.skip_node[index->second] = 1;
+        }
+    }
+    result.enabled = true;
+    return result;
+}
+
+static bool ggml_vk_execute_d2f_parallel_region(
+        ggml_backend_vk_context * ctx,
+        const ggml_vk_d2f::packed_attention_region & region,
+        const std::unordered_map<const ggml_tensor *, int> & node_indices,
+        bool submit_join) {
+    const uint32_t active_queue_count = std::min<uint32_t>(
+        ggml_vk_compute_queue_count(ctx),
+        static_cast<uint32_t>(region.lanes.size()));
+    GGML_ASSERT(active_queue_count >= 2);
+
+    vk_context prelude_ctx = ggml_vk_get_compute_ctx(ctx, 0);
+    if (!prelude_ctx->out_memcpys.empty()) {
+        ggml_vk_synchronize(ctx);
+        ggml_vk_get_compute_ctx(ctx, 0);
+    }
+    ++ctx->d2f_fork_semaphore.value;
+    const vk_semaphore fork = ctx->d2f_fork_semaphore;
+    if (!ggml_vk_submit_compute_ctx(ctx, 0, {}, { fork })) {
+        return false;
+    }
+    ctx->unsynced_nodes_written.clear();
+    ctx->unsynced_nodes_read.clear();
+
+    std::vector<uint8_t> queue_used(active_queue_count, 0);
+    for (const auto & lane : region.lanes) {
+        const uint32_t queue_index = static_cast<uint32_t>(lane.id) % active_queue_count;
+        vk_context lane_ctx = ggml_vk_get_compute_ctx(ctx, queue_index);
+        const ggml_tensor * flash = lane.flash_attn;
+        ggml_vk_flash_attn(
+            ctx,
+            lane_ctx,
+            flash->src[0],
+            flash->src[1],
+            flash->src[2],
+            flash->src[3],
+            flash->src[4],
+            const_cast<ggml_tensor *>(flash),
+            true);
+        queue_used[queue_index] = 1;
+        ctx->tensor_ctxs[lane.flash_node_index] = lane_ctx;
+    }
+
+    std::vector<vk_semaphore> worker_done;
+    for (uint32_t queue_index = 1; queue_index < active_queue_count; ++queue_index) {
+        if (!queue_used[queue_index]) {
+            continue;
+        }
+        vk_semaphore & done = ctx->d2f_worker_done_semaphores[queue_index - 1];
+        ++done.value;
+        if (!ggml_vk_submit_compute_ctx(ctx, queue_index, { fork }, { done })) {
+            return false;
+        }
+        worker_done.push_back(done);
+    }
+    GGML_ASSERT(queue_used[0]);
+    if (!ggml_vk_submit_compute_ctx(ctx, 0, { fork })) {
+        return false;
+    }
+
+    vk_context join_ctx = ggml_vk_get_compute_ctx(ctx, 0);
+    join_ctx->s->wait_semaphores.insert(
+        join_ctx->s->wait_semaphores.end(),
+        worker_done.begin(),
+        worker_done.end());
+    for (const ggml_tensor * concat : region.concat_postorder) {
+        ggml_vk_sync_buffers(ctx, join_ctx);
+        ggml_vk_concat(
+            ctx,
+            join_ctx,
+            concat->src[0],
+            concat->src[1],
+            const_cast<ggml_tensor *>(concat));
+        const auto index = node_indices.find(concat);
+        GGML_ASSERT(index != node_indices.end());
+        ctx->tensor_ctxs[index->second] = join_ctx;
+    }
+
+    ctx->unsynced_nodes_written.push_back(region.join);
+    for (int source = 0; source < 2; ++source) {
+        ctx->unsynced_nodes_read.push_back(region.join->src[source]);
+    }
+    if (submit_join) {
+        if (!ggml_vk_submit_compute_ctx(ctx, 0)) {
+            return false;
+        }
+    }
+    return !worker_done.empty();
+}
+
+static void ggml_vk_abort_d2f_parallel_graph(ggml_backend_vk_context * ctx) {
+    for (uint32_t queue_index = 0; queue_index < ggml_vk_compute_queue_count(ctx); ++queue_index) {
+        ggml_vk_discard_compute_ctx(ctx, queue_index);
+    }
+    ggml_vk_synchronize(ctx);
+    ggml_vk_graph_cleanup(ctx);
+}
+
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
@@ -16561,6 +17092,23 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     while (last_node > 0 && (ggml_vk_is_empty(cgraph->nodes[last_node]) || ((cgraph->nodes[last_node]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0))) {
         last_node -= 1;
     }
+
+    ggml_vk_d2f_parallel_graph d2f_parallel = ggml_vk_prepare_d2f_parallel_graph(ctx, cgraph);
+    if (!d2f_parallel.enabled && d2f_parallel.disabled_reason != nullptr) {
+        GGML_LOG_DEBUG(
+            "D2F Vulkan parallel Flash Attention not activated: reason=%s\n",
+            d2f_parallel.disabled_reason);
+    }
+    std::unordered_map<const ggml_tensor *, int> d2f_node_indices;
+    if (d2f_parallel.enabled) {
+        d2f_node_indices.reserve(cgraph->n_nodes);
+        for (int index = 0; index < cgraph->n_nodes; ++index) {
+            d2f_node_indices.emplace(cgraph->nodes[index], index);
+        }
+    }
+    int d2f_parallel_regions_activated = 0;
+    int d2f_parallel_domains_min = INT_MAX;
+    int d2f_parallel_domains_max = 0;
 
     // Reserve tensor context space for all nodes
     ctx->tensor_ctxs.resize(cgraph->n_nodes);
@@ -16642,6 +17190,29 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             auto node_flops = ggml_vk_get_node_flops(cgraph->nodes[i]);
             batch_flops += node_flops;
             total_flops += node_flops;
+        }
+
+        if (d2f_parallel.enabled && d2f_parallel.skip_node[i]) {
+            const int region_index = d2f_parallel.region_for_join[i];
+            if (region_index >= 0) {
+                const auto & region = d2f_parallel.parsed.regions[region_index];
+                if (!ggml_vk_execute_d2f_parallel_region(
+                        ctx,
+                        region,
+                        d2f_node_indices,
+                        region.join_node_index >= last_node)) {
+                    ggml_vk_abort_d2f_parallel_graph(ctx);
+                    return GGML_STATUS_FAILED;
+                }
+                ++d2f_parallel_regions_activated;
+                d2f_parallel_domains_min = std::min<int>(d2f_parallel_domains_min, region.lanes.size());
+                d2f_parallel_domains_max = std::max<int>(d2f_parallel_domains_max, region.lanes.size());
+                first_node_in_batch = true;
+                submitted_nodes = 0;
+                batch_flops = 0;
+                ++submit_count;
+            }
+            continue;
         }
 
         // op_srcs_fused_elementwise indicates whether an op's srcs all contribute to
@@ -16946,6 +17517,19 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
     if (!ctx->device->support_async) {
         ggml_vk_synchronize(ctx);
+    }
+
+    if (d2f_parallel_regions_activated > 0) {
+        ctx->d2f_parallel_activation_count.fetch_add(1, std::memory_order_relaxed);
+        if (!ctx->d2f_parallel_activation_logged) {
+            GGML_LOG_INFO(
+                "D2F Vulkan multi-queue Flash Attention submitted: regions=%d domains_min=%d domains_max=%d compute_queues=%u\n",
+                d2f_parallel_regions_activated,
+                d2f_parallel_domains_min,
+                d2f_parallel_domains_max,
+                std::min<uint32_t>(ggml_vk_compute_queue_count(ctx), d2f_parallel_domains_max));
+            ctx->d2f_parallel_activation_logged = true;
+        }
     }
 
     return GGML_STATUS_SUCCESS;
@@ -17295,20 +17879,42 @@ static ggml_guid_t ggml_backend_vk_guid() {
 ggml_backend_t ggml_backend_vk_init(size_t dev_num) {
     VK_LOG_DEBUG("ggml_backend_vk_init(" << dev_num << ")");
 
-    ggml_backend_vk_context * ctx = new ggml_backend_vk_context;
-    ggml_vk_init(ctx, dev_num);
+    std::unique_ptr<ggml_backend_vk_context> ctx(new ggml_backend_vk_context);
+    try {
+        ggml_vk_init(ctx.get(), dev_num);
+    } catch (...) {
+        if (ctx->device != nullptr) {
+            try {
+                ggml_vk_cleanup(ctx.get());
+            } catch (...) {
+                GGML_LOG_WARN("ggml_vulkan: cleanup failed after backend initialization error\n");
+            }
+        }
+        throw;
+    }
 
-    ggml_backend_t vk_backend = new ggml_backend {
-        /* .guid    = */ ggml_backend_vk_guid(),
-        /* .iface   = */ ggml_backend_vk_interface,
-        /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_vk_reg(), dev_num),
-        /* .context = */ ctx,
-    };
+    ggml_backend_t vk_backend = nullptr;
+    try {
+        vk_backend = new ggml_backend {
+            /* .guid    = */ ggml_backend_vk_guid(),
+            /* .iface   = */ ggml_backend_vk_interface,
+            /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_vk_reg(), dev_num),
+            /* .context = */ ctx.get(),
+        };
+    } catch (...) {
+        try {
+            ggml_vk_cleanup(ctx.get());
+        } catch (...) {
+            GGML_LOG_WARN("ggml_vulkan: cleanup failed after backend allocation error\n");
+        }
+        throw;
+    }
 
     if (!ctx->device->support_async) {
         vk_backend->iface.get_tensor_async = nullptr;
     }
 
+    ctx.release();
     return vk_backend;
 }
 
@@ -18258,11 +18864,29 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device];
 }
 
+static uint64_t ggml_backend_vk_get_d2f_parallel_activation_count(ggml_backend_t backend) {
+    if (!ggml_backend_is_vk(backend)) {
+        return 0;
+    }
+
+    const ggml_backend_vk_context * ctx =
+        static_cast<const ggml_backend_vk_context *>(backend->context);
+    return ctx->d2f_parallel_activation_count.load(std::memory_order_relaxed);
+}
+
+static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_get_d2f_parallel_activation_count") == 0) {
+        return reinterpret_cast<void *>(ggml_backend_vk_get_d2f_parallel_activation_count);
+    }
+    return nullptr;
+}
+
 static const struct ggml_backend_reg_i ggml_backend_vk_reg_i = {
     /* .get_name         = */ ggml_backend_vk_reg_get_name,
     /* .get_device_count = */ ggml_backend_vk_reg_get_device_count,
     /* .get_device       = */ ggml_backend_vk_reg_get_device,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_vk_reg_get_proc_address,
 };
 
 ggml_backend_reg_t ggml_backend_vk_reg() {

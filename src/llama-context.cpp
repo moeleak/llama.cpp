@@ -886,8 +886,13 @@ uint64_t llama_context::d2f_parallel_activation_count() const {
         activation_count_fn get_count = registry
                 ? reinterpret_cast<activation_count_fn>(ggml_backend_reg_get_proc_address(
                         registry,
-                        "ggml_backend_cuda_get_d2f_parallel_activation_count"))
+                        "ggml_backend_get_d2f_parallel_activation_count"))
                 : nullptr;
+        if (!get_count && registry) {
+            get_count = reinterpret_cast<activation_count_fn>(ggml_backend_reg_get_proc_address(
+                    registry,
+                    "ggml_backend_cuda_get_d2f_parallel_activation_count"));
+        }
         if (!get_count) {
             continue;
         }

@@ -94,8 +94,13 @@ Prefix prefill has four explicit modes:
   a backend-specific `cu_seqlens` kernel. CUDA may schedule validated lane
   branches on multiple worker streams; only
   `D2F CUDA parallel Flash Attention activated: ...` confirms that validated
-  packed-attention regions were enabled at runtime. Other backends make no
-  hardware-concurrency claim.
+  packed-attention regions were enabled at runtime. Vulkan uses distinct
+  compute queues from one queue family with timeline-semaphore fork/join;
+  `D2F Vulkan multi-queue Flash Attention submitted: ...` confirms validated
+  work was submitted to distinct logical queues. It does not by itself prove
+  that a mobile driver overlapped the queues on separate hardware; timestamps
+  and an end-to-end latency comparison provide that evidence. Backends without
+  an activation message make no multi-queue submission claim.
 - `--prefix-prefill-mode packed_image --prefix-pack-size 512` splits only image
   spans into bounded chunks and still submits the complete prompt at once. It
   changes image-token visibility across chunk boundaries, so it is an opt-in
@@ -119,10 +124,20 @@ is marked known only for the exact ragged branches. `batched_prefill=true`
 means one image-only `llama_decode()` submitted all domains; it does not claim
 that the backend ran the per-domain Flash Attention nodes concurrently.
 `parallel_activation_count_delta` is the backend-reported number of validated
-packed-attention graph computes activated during that image decode, and
+packed-attention graph computes submitted through a backend parallel path
+during that image decode, and
 `parallel_effective=true` requires both a batched submission and a positive
 delta. CPU, Metal, and other backends without this audit hook report zero and
-do not claim hardware parallelism.
+do not claim hardware parallelism. Vulkan uses one compute queue by default;
+`GGML_VK_D2F_COMPUTE_QUEUES=N` opts into 2 through 8 queues (or explicitly
+selects 1), clamped to the physical queue-family count. Devices exposing one
+compute queue, or no timeline-semaphore support, retain the sequential packed
+graph and report zero activation. A positive Vulkan delta proves
+distinct-queue submission, not physical overlap. Concurrent Vulkan lanes force
+the non-split Flash Attention path so they never share split-K scratch storage;
+ordinary Vulkan attention is unchanged. The Android quality, stability, and
+latency gate must compare the same samples against `component_exact` before an
+application opts a device into multi-queue execution.
 
 A fixed three-span A800 diagnostic used the same Q3_K_L language model, Q8_0
 vision projector, screenshot, prompt, 16K context, F16 KV cache, Flash
@@ -149,6 +164,25 @@ as the source of that difference. This diagnostic has no bound ground-truth
 box and therefore does not claim an SSR result. One parallel generation run
 was a first-run outlier, so the three-run p90 values are not a tail-latency
 improvement claim.
+
+A Pixel 9 Pro XL (Mali-G715) exposes two queues in one compute family and
+timeline semaphores. With `GGML_VK_D2F_COMPUTE_QUEUES=2`, a fixed 88-token,
+two-span diagnostic activated both logical queues in all 32 language layers.
+The image prefill took 31.307 seconds versus 19.216 seconds for
+`component_exact`, and complete prefix prefill took 57.884 seconds versus
+47.382 seconds. It then completed 11 D2F iterations without losing the Vulkan
+device. A 150-token, three-span diagnostic also activated both queues, finished
+image prefill in 53.670 seconds, and completed its one requested D2F iteration.
+These diagnostics prove the two- and three-domain paths execute successfully,
+but show that multi-queue overhead dominates small mobile inputs.
+
+The same Pixel accepted a 6,110-token, three-span multi-queue graph but reported
+`VK_ERROR_DEVICE_LOST` before image prefill completed. This was a stability
+probe, not an accuracy benchmark. The input used 3,200 MiB of F16 KV cache and
+about 1,241 MiB of Vulkan compute workspace in addition to the model and vision
+allocations. Therefore mobile multi-queue execution remains explicit opt-in;
+applications must gate it by device, workload size, stability, and measured
+latency rather than only by the advertised queue count.
 
 `--release-vision-after-encode` releases the native vision context after the
 image embedding has been cached. A repeated request with the same non-empty
