@@ -16,12 +16,25 @@ from .base import MmprojModel, ModelBase, TextModel, gguf
     "Qwen2VLForConditionalGeneration",
     "Qwen2_5_VLForConditionalGeneration",
     "Qwen2_5OmniModel",
+    "Fast_dVLMForConditionalGeneration",
 )
 class Qwen2VLModel(TextModel):
     model_arch = gguf.MODEL_ARCH.QWEN2VL
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
+        if self.hf_arch == "Fast_dVLMForConditionalGeneration":
+            global_config = ModelBase.load_hparams(self.dir_model, self.is_mistral_format)
+            self.gguf_writer.add_mask_token_id(151665)
+            self.gguf_writer.add_bool("fast_dvlm.diffusion", True)
+            self.gguf_writer.add_uint32(
+                "fast_dvlm.block_size", int(global_config.get("bd_size", 32))
+            )
+            self.gguf_writer.add_uint32(
+                "fast_dvlm.sub_block_size", int(self.hparams.get("bd_size", 8))
+            )
+            self.gguf_writer.add_float32("fast_dvlm.confidence_threshold", 0.9)
+            self.gguf_writer.add_uint32("fast_dvlm.token_shift", 1)
 
     def set_vocab(self):
         try:
@@ -39,7 +52,12 @@ class Qwen2VLModel(TextModel):
         return super().filter_tensors((name, gen))
 
 
-@ModelBase.register("Qwen2VLModel", "Qwen2VLForConditionalGeneration", "Qwen2_5_VLForConditionalGeneration")
+@ModelBase.register(
+    "Qwen2VLModel",
+    "Qwen2VLForConditionalGeneration",
+    "Qwen2_5_VLForConditionalGeneration",
+    "Fast_dVLMForConditionalGeneration",
+)
 class Qwen2VLVisionModel(MmprojModel):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -59,7 +77,7 @@ class Qwen2VLVisionModel(MmprojModel):
         model_type = self.global_config['model_type']
         if model_type == 'qwen2_vl':
             self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.QWEN2VL)
-        elif model_type == 'qwen2_5_vl' or model_type == 'qwen2_5_omni':
+        elif model_type in {'qwen2_5_vl', 'qwen2_5_omni', 'fast_dvlm'}:
             if model_type == 'qwen2_5_omni':
                 self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.QWEN25O)
             else:
@@ -74,6 +92,15 @@ class Qwen2VLVisionModel(MmprojModel):
                 if fullatt_block_indexes[i] - fullatt_block_indexes[i - 1] != n_wa_pattern:
                     raise ValueError(f"Invalid fullatt_block_indexes: {fullatt_block_indexes}")
             self.gguf_writer.add_vision_n_wa_pattern(n_wa_pattern)
+            if model_type == 'fast_dvlm':
+                min_pixels = int(self.preprocessor_config["min_pixels"])
+                max_pixels = int(self.preprocessor_config["max_pixels"])
+                if min_pixels <= 0 or max_pixels < min_pixels:
+                    raise ValueError(
+                        f"Invalid Fast-dVLM processor pixel range: {min_pixels}..{max_pixels}"
+                    )
+                self.gguf_writer.add_vision_min_pixels(min_pixels)
+                self.gguf_writer.add_vision_max_pixels(max_pixels)
         else:
             raise ValueError(f"Unknown QwenVL model type: {self.global_config['model_type']}")
         # default values below are taken from HF tranformers code
@@ -88,10 +115,13 @@ class Qwen2VLVisionModel(MmprojModel):
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
         name, gen = item
 
+        if name.startswith("model.visual."):
+            name = name.removeprefix("model.")
+
         if not name.startswith("visual."):
             return None
 
-        return super().filter_tensors(item)
+        return super().filter_tensors((name, gen))
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         # split QKV tensors if needed

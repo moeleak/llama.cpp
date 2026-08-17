@@ -1502,8 +1502,23 @@ struct clip_model_loader {
                         hparams.image_resize_algo = RESIZE_ALGO_BILINEAR;
                         get_u32(KEY_SPATIAL_MERGE_SIZE, hparams.n_merge, false);
                         get_u32(KEY_WIN_ATTN_PATTERN, hparams.n_wa_pattern, model.proj_type == PROJECTOR_TYPE_QWEN25VL); // only 2.5 requires it
-                        // ref: https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct/blob/main/preprocessor_config.json
-                        hparams.set_limit_image_tokens(8, 4096);
+
+                        int min_pixels = 0;
+                        int max_pixels = 0;
+                        get_u32(KEY_IMAGE_MIN_PIXELS, min_pixels, false);
+                        get_u32(KEY_IMAGE_MAX_PIXELS, max_pixels, false);
+                        if (min_pixels > 0 && max_pixels >= min_pixels) {
+                            const int patch_area = hparams.patch_size * hparams.patch_size * hparams.n_merge * hparams.n_merge;
+                            hparams.image_min_pixels = hparams.custom_image_min_tokens > 0
+                                ? hparams.custom_image_min_tokens * patch_area
+                                : min_pixels;
+                            hparams.image_max_pixels = hparams.custom_image_max_tokens > 0
+                                ? hparams.custom_image_max_tokens * patch_area
+                                : max_pixels;
+                        } else {
+                            // ref: https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct/blob/main/preprocessor_config.json
+                            hparams.set_limit_image_tokens(8, 4096);
+                        }
                         hparams.set_warmup_n_tokens(46*46); // avoid OOM on warmup
                         const int warn_min_pixels = 1024 * hparams.n_merge * hparams.n_merge * hparams.patch_size * hparams.patch_size;
                         if (hparams.image_min_pixels < warn_min_pixels) {
