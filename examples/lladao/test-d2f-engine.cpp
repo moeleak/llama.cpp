@@ -243,6 +243,34 @@ int main() {
     }
 
     {
+        const auto lanes = lladao::detail::plan_packed_parallel_lanes({ 1858 }, 512);
+        const auto chunks = lladao::detail::plan_prefix_chunks(
+                { 1858 },
+                403,
+                lladao::d2f_prefix_prefill_mode::packed_parallel,
+                512);
+        const auto audit = lladao::detail::audit_prefix_parallelism(
+                { 1858 },
+                lladao::d2f_prefix_prefill_mode::packed_parallel,
+                true,
+                512);
+        if (lanes != std::vector<int32_t>({ 512, 512, 512, 322 }) ||
+            chunks.size() != 2 || chunks[0].offset != 0 || chunks[0].length != 1858 ||
+            chunks[0].kind != lladao::detail::prefix_chunk_kind::image ||
+            chunks[1].offset != 1858 || chunks[1].length != 403 ||
+            chunks[1].kind != lladao::detail::prefix_chunk_kind::prompt ||
+            audit.cu_seqlens != std::vector<int32_t>({ 0, 512, 1024, 1536, 1858 }) ||
+            audit.domains != 4 || audit.image_decode_calls != 1 ||
+            audit.attention_pairs_dense != 3452164 ||
+            audit.attention_pairs_packed != 890116 || !audit.batched_submission ||
+            std::string(lladao::detail::prefix_prefill_semantics_name(
+                    lladao::d2f_prefix_prefill_mode::packed_parallel)) !=
+                    "approximate_cross_chunk_isolated") {
+            throw std::runtime_error("packed parallel single-image plan is invalid");
+        }
+    }
+
+    {
         std::unique_ptr<int> vision = std::make_unique<int>(1);
         if (lladao::detail::release_vision_context(vision, false) || !vision) {
             throw std::runtime_error("disabled vision release changed the context");
@@ -323,6 +351,13 @@ int main() {
     require_configuration_valid(params);
 
     params.prefix_prefill_mode = lladao::d2f_prefix_prefill_mode::component_parallel;
+    require_invalid(params);
+
+    params.flash_attention_mode = lladao::d2f_flash_attention_mode::auto_select;
+    require_configuration_valid(params);
+
+    params.flash_attention_mode = lladao::d2f_flash_attention_mode::disabled;
+    params.prefix_prefill_mode = lladao::d2f_prefix_prefill_mode::packed_parallel;
     require_invalid(params);
 
     params.flash_attention_mode = lladao::d2f_flash_attention_mode::auto_select;

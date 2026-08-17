@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml.h"
+#include "lladao-d2f-phase-io.h"
 
 #include <cstdint>
 #include <memory>
@@ -13,6 +14,7 @@ enum class d2f_prefix_prefill_mode : int32_t {
     component_exact = 1,
     packed_image = 2,
     component_parallel = 3,
+    packed_parallel = 4,
 };
 
 enum class d2f_flash_attention_mode : int32_t {
@@ -25,6 +27,7 @@ struct d2f_engine_params {
     std::string model_path;
     std::string mmproj_path;
     std::string adapter_path;
+    std::string devices;
     int32_t context_size = 16384;
     int32_t gpu_layers = 999;
     int32_t threads = 0;
@@ -54,6 +57,7 @@ struct d2f_engine_params {
     bool cpu_strict = false;
     bool release_vision_after_encode = false;
     bool vision_kv_compression = false;
+    bool use_mmap = true;
     bool print_timings = true;
 };
 
@@ -83,6 +87,7 @@ struct d2f_result {
     std::string flash_attention_requested;
     std::string flash_attention_resolved;
     std::string prefix_prefill_mode;
+    std::string prefix_prefill_semantics;
     std::string backend;
     std::string cpu_mask_requested;
     std::string cpu_mask_resolved;
@@ -117,11 +122,23 @@ struct d2f_result {
     int32_t parallel_lane_tokens = 0;
     int32_t parallel_padding_tokens = 0;
     double prefill_seconds = 0.0;
+    double prefill_phase_seconds = 0.0;
+    double prefix_build_seconds = 0.0;
+    double prefill_batch_build_seconds = 0.0;
+    double prefill_llama_decode_seconds = 0.0;
     double state_io_seconds = 0.0;
     double decode_seconds = 0.0;
     double vision_encode_seconds = 0.0;
+    double vision_phase_seconds = 0.0;
+    double vision_embedding_copy_seconds = 0.0;
     double kv_cache_compression_seconds = 0.0;
     double generation_seconds = 0.0;
+    uint64_t vision_embedding_copy_bytes = 0;
+    uint64_t prefix_build_copy_bytes = 0;
+    uint64_t prefill_batch_copy_bytes = 0;
+    d2f_phase_resource_usage vision_resources;
+    d2f_phase_resource_usage prefill_resources;
+    d2f_phase_resource_usage decode_resources;
     bool vision_cache_hit = false;
     bool generation_block_cache = false;
     bool sparse_generation_logits = false;

@@ -166,6 +166,7 @@ struct clip_ctx {
     bool is_allocated = false;
 
     bool debug_output_embeddings = false;
+    bool profile_output_transfer = false;
 
     // for measuring memory usage
     bool no_alloc = false;
@@ -223,6 +224,8 @@ struct clip_ctx {
         }
 
         debug_output_embeddings = std::getenv("MTMD_DEBUG_EMBEDDINGS") != nullptr;
+        const char * profile_output_transfer_env = std::getenv("MTMD_PROFILE_OUTPUT_TRANSFER");
+        profile_output_transfer = profile_output_transfer_env != nullptr && std::strcmp(profile_output_transfer_env, "1") == 0;
     }
 
     ~clip_ctx() {
@@ -4910,6 +4913,13 @@ bool clip_image_batch_encode(clip_ctx * ctx, int n_threads, const clip_image_f32
         return false;
     }
 
+    int64_t output_compute_wait_us = 0;
+    if (ctx->profile_output_transfer) {
+        const int64_t t_start_us = ggml_time_us();
+        ggml_backend_sched_synchronize(ctx->sched.get());
+        output_compute_wait_us = ggml_time_us() - t_start_us;
+    }
+
     // the last node is the embedding tensor
     ggml_tensor * embeddings = ggml_graph_node(gf, -1);
 
@@ -4931,7 +4941,16 @@ bool clip_image_batch_encode(clip_ctx * ctx, int n_threads, const clip_image_f32
             LOG_ERR("%s: output buffer has %zu elements but expected %zu\n", __func__, out_batch_embd.size(), (size_t)ggml_nelements(embeddings));
             GGML_ABORT("Output buffer size mismatch");
         }
-        ggml_backend_tensor_get(embeddings, out_batch_embd.data(), 0, ggml_nbytes(embeddings));
+        if (ctx->profile_output_transfer) {
+            const size_t output_bytes = ggml_nbytes(embeddings);
+            const int64_t t_start_us = ggml_time_us();
+            ggml_backend_tensor_get(embeddings, out_batch_embd.data(), 0, output_bytes);
+            const int64_t download_us = ggml_time_us() - t_start_us;
+            LOG_INF("%s: MTMD_PROFILE_OUTPUT_TRANSFER bytes=%zu compute_wait_seconds=%.6f download_seconds=%.6f\n",
+                    __func__, output_bytes, output_compute_wait_us / 1e6, download_us / 1e6);
+        } else {
+            ggml_backend_tensor_get(embeddings, out_batch_embd.data(), 0, ggml_nbytes(embeddings));
+        }
     } else {
         LOG_WRN("%s: output buffer is empty, skipping copy\n", __func__);
     }

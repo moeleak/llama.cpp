@@ -20,6 +20,8 @@ max_iterations=256
 vision_gpu=1
 preprocess_only=0
 prefix_cache=1
+prefix_prefill_mode="exact"
+prefix_pack_size=512
 pd_prefill_out=""
 pd_decode_in=""
 
@@ -34,6 +36,8 @@ Options:
   --threads N              Default: 4
   --max-iterations N       Default: 256
   --no-prefix-cache        Recompute the full sequence on every D2F iteration
+  --prefix-prefill-mode M  Prefix mode, including packed_parallel (default: exact)
+  --prefix-pack-size N     Packed lane size (default: 512)
   --pd-prefill-out PATH    Save prefix KV to this path on the Android device
   --pd-decode-in PATH      Restore prefix KV from this path on the Android device
   --vision-gpu             Default: enabled
@@ -83,6 +87,14 @@ while [[ $# -gt 0 ]]; do
         --no-prefix-cache)
             prefix_cache=0
             shift
+            ;;
+        --prefix-prefill-mode)
+            prefix_prefill_mode="$2"
+            shift 2
+            ;;
+        --prefix-pack-size)
+            prefix_pack_size="$2"
+            shift 2
             ;;
         --pd-prefill-out)
             pd_prefill_out="$2"
@@ -218,7 +230,9 @@ for argument in \
     --ctx-size "${ctx_size}" \
     --gpu-layers "${gpu_layers}" \
     --threads "${threads}" \
-    --max-iterations "${max_iterations}"; do
+    --max-iterations "${max_iterations}" \
+    --prefix-prefill-mode "${prefix_prefill_mode}" \
+    --prefix-pack-size "${prefix_pack_size}"; do
     command+=" $(quote_android "${argument}")"
 done
 if [[ -n "${pd_decode_in}" ]]; then

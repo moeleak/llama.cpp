@@ -144,6 +144,35 @@ int main() {
             lladao::d2f_prefix_prefill_mode::component_exact,
             false);
 
+    const auto packed_parallel = lladao::detail::audit_prefix_parallelism(
+            { 10 },
+            lladao::d2f_prefix_prefill_mode::packed_parallel,
+            true,
+            4);
+    if (packed_parallel.cu_seqlens != std::vector<int32_t>({ 0, 4, 8, 10 }) ||
+        packed_parallel.domains != 3 || packed_parallel.image_decode_calls != 1 ||
+        packed_parallel.attention_pairs_dense != 100 ||
+        packed_parallel.attention_pairs_packed != 36 ||
+        !packed_parallel.batched_submission ||
+        lladao::detail::prefix_attention_allowed(packed_parallel, 3, 4) ||
+        !lladao::detail::prefix_attention_allowed(packed_parallel, 4, 7)) {
+        throw std::runtime_error("single-image packed_parallel visibility is invalid");
+    }
+    rejected = false;
+    try {
+        lladao::detail::validate_prefix_parallel_backend(
+                lladao::d2f_prefix_prefill_mode::packed_parallel,
+                false);
+    } catch (const std::invalid_argument &) {
+        rejected = true;
+    }
+    if (!rejected) {
+        throw std::runtime_error("packed_parallel accepted unresolved Flash Attention");
+    }
+    lladao::detail::validate_prefix_parallel_backend(
+            lladao::d2f_prefix_prefill_mode::packed_parallel,
+            true);
+
     // Packed image shape is request-local. Different token counts, maximum
     // lane lengths, and lane counts reuse one language context whenever its
     // resident, batch, output, and sequence capacities cover both requests.

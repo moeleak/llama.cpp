@@ -47,10 +47,55 @@ namespace {
 constexpr int32_t D2F_GENERATION_LENGTH = 64;
 constexpr int32_t D2F_BLOCK_LENGTH      = 16;
 
+void print_phase_resources(
+        const char * phase,
+        double wall_seconds,
+        const lladao::d2f_phase_resource_usage & usage,
+        const char * component = nullptr) {
+    if (component) {
+        std::fprintf(
+                stderr,
+                "D2F phase_resources phase=%s component=%s"
+                " wall_seconds=%.6f cpu_seconds=%.6f"
+                " minor_faults=%" PRIu64 " major_faults=%" PRIu64
+                " inblock=%" PRIu64 " oublock=%" PRIu64
+                " proc_io_available=%s read_bytes=%" PRIu64 " write_bytes=%" PRIu64 "\n",
+                phase,
+                component,
+                wall_seconds,
+                usage.process_cpu_seconds,
+                usage.minor_page_faults,
+                usage.major_page_faults,
+                usage.block_input_operations,
+                usage.block_output_operations,
+                usage.proc_io_available ? "true" : "false",
+                usage.read_bytes,
+                usage.write_bytes);
+    } else {
+        std::fprintf(
+                stderr,
+                "D2F phase_resources phase=%s wall_seconds=%.6f cpu_seconds=%.6f"
+                " minor_faults=%" PRIu64 " major_faults=%" PRIu64
+                " inblock=%" PRIu64 " oublock=%" PRIu64
+                " proc_io_available=%s read_bytes=%" PRIu64 " write_bytes=%" PRIu64 "\n",
+                phase,
+                wall_seconds,
+                usage.process_cpu_seconds,
+                usage.minor_page_faults,
+                usage.major_page_faults,
+                usage.block_input_operations,
+                usage.block_output_operations,
+                usage.proc_io_available ? "true" : "false",
+                usage.read_bytes,
+                usage.write_bytes);
+    }
+}
+
 struct params {
     std::string model;
     std::string mmproj;
     std::string lora;
+    std::string devices;
     std::string image;
     std::string prompt;
     std::string retrieval_query;
@@ -94,6 +139,7 @@ struct params {
     bool        cpu_strict = false;
     bool        release_vision_after_encode = false;
     bool        vision_kv_compression = false;
+    bool        use_mmap = true;
     bool        print_timings = true;
 };
 
@@ -115,6 +161,8 @@ void print_usage(const char * program) {
             "  --lora PATH           Optional F32 D2F LoRA GGUF\n"
             "  --ctx-size N          Context capacity (default: 16384)\n"
             "  --gpu-layers N        Layers to offload (default: 999)\n"
+            "  --device NAMES        Explicit offload devices separated by comma or slash\n"
+            "  --no-mmap             Load model weights without mmap (recommended for Hexagon)\n"
             "  --vision-gpu          Offload the vision projector even with --gpu-layers 0\n"
             "  --no-vision-gpu       Keep the vision projector on the CPU\n"
             "  --threads N           CPU threads (default: backend choice)\n"
@@ -135,9 +183,10 @@ void print_usage(const char * program) {
             "  --dense-generation-logits\n"
             "                        Request logits for every decoded generation row\n"
             "  --prefix-prefill-mode MODE\n"
-            "                        exact, component_exact, component_parallel, or packed_image\n"
+            "                        exact, component_exact, component_parallel, packed_image,\n"
+            "                        or packed_parallel\n"
             "                        (default: exact)\n"
-            "  --prefix-pack-size N Image chunk size for packed_image (default: 512)\n"
+            "  --prefix-pack-size N Image chunk or packed lane size (default: 512)\n"
             "  --vision-kv-compression\n"
             "                        Score and compact visual KV per layer and KV head\n"
             "  --vision-kv-tile-size N\n"
@@ -274,8 +323,11 @@ lladao::d2f_prefix_prefill_mode parse_prefix_prefill_mode(const char * value) {
     if (std::strcmp(value, "packed_image") == 0) {
         return lladao::d2f_prefix_prefill_mode::packed_image;
     }
+    if (std::strcmp(value, "packed_parallel") == 0) {
+        return lladao::d2f_prefix_prefill_mode::packed_parallel;
+    }
     throw std::invalid_argument(
-            std::string("--prefix-prefill-mode must be exact, component_exact, component_parallel, or packed_image: ") + value);
+            std::string("--prefix-prefill-mode must be exact, component_exact, component_parallel, packed_image, or packed_parallel: ") + value);
 }
 
 lladao::d2f_flash_attention_mode parse_flash_attention_mode(const char * value) {
@@ -317,6 +369,10 @@ params parse_args(int argc, char ** argv) {
             result.n_ctx = parse_i32(arg.c_str(), next());
         } else if (arg == "--gpu-layers" || arg == "-ngl") {
             result.n_gpu_layers = parse_i32(arg.c_str(), next());
+        } else if (arg == "--device" || arg == "-dev") {
+            result.devices = next();
+        } else if (arg == "--no-mmap") {
+            result.use_mmap = false;
         } else if (arg == "--vision-gpu") {
             result.vision_gpu = 1;
         } else if (arg == "--no-vision-gpu") {
@@ -456,9 +512,11 @@ params parse_args(int argc, char ** argv) {
     if (result.prefix_prefill_mode != lladao::d2f_prefix_prefill_mode::exact && !result.prefix_cache) {
         throw std::invalid_argument("split prefix prefill modes require the prefix cache");
     }
-    if (result.prefix_prefill_mode == lladao::d2f_prefix_prefill_mode::component_parallel &&
+    if (lladao::detail::prefix_prefill_requires_flash_attention(result.prefix_prefill_mode) &&
         result.flash_attention_mode == lladao::d2f_flash_attention_mode::disabled) {
-        throw std::invalid_argument("component_parallel requires Flash Attention");
+        throw std::invalid_argument(
+                std::string(lladao::detail::prefix_prefill_mode_name(result.prefix_prefill_mode)) +
+                " requires Flash Attention");
     }
     if (result.vision_kv_compression &&
         result.prefix_prefill_mode != lladao::d2f_prefix_prefill_mode::component_parallel) {
@@ -753,6 +811,8 @@ class token_embedding_reader {
 
 struct encoded_image {
     std::vector<float> embeddings;
+    uint64_t embedding_copy_bytes = 0;
+    double embedding_copy_seconds = 0.0;
     int32_t n_tokens = 0;
     int32_t grid_width = 0;
     int32_t grid_height = 0;
@@ -856,8 +916,13 @@ encoded_image encode_bitmap(
         static_cast<int64_t>(result.grid_width) * result.grid_height != result.n_tokens) {
         throw std::runtime_error("vision patch grid does not match the encoded token count");
     }
-    result.embeddings.assign(
-            output, output + static_cast<size_t>(result.n_tokens) * static_cast<size_t>(n_embd));
+    const size_t embedding_values =
+            static_cast<size_t>(result.n_tokens) * static_cast<size_t>(n_embd);
+    const auto embedding_copy_started = std::chrono::steady_clock::now();
+    result.embeddings.assign(output, output + embedding_values);
+    result.embedding_copy_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - embedding_copy_started).count();
+    result.embedding_copy_bytes = static_cast<uint64_t>(embedding_values) * sizeof(float);
     return result;
 }
 
@@ -1595,6 +1660,7 @@ struct packed_image_prefill_plan {
     int32_t lane_tokens = 0;
     int32_t padded_tokens = 0;
     int32_t padding_tokens = 0;
+    std::vector<int32_t> lengths;
 };
 
 packed_image_prefill_plan make_packed_image_prefill_plan(
@@ -1604,6 +1670,7 @@ packed_image_prefill_plan make_packed_image_prefill_plan(
     }
 
     packed_image_prefill_plan result;
+    result.lengths = image_lengths;
     result.streams = static_cast<int32_t>(image_lengths.size());
     const int32_t max_length = *std::max_element(image_lengths.begin(), image_lengths.end());
     if (max_length <= 0) {
@@ -1634,7 +1701,7 @@ void fill_packed_image_prefill_batch(
         const prefix & input_prefix,
         const packed_image_prefill_plan & plan,
         int32_t n_embd) {
-    if (plan.streams != static_cast<int32_t>(input_prefix.image_lengths.size()) ||
+    if (plan.streams != static_cast<int32_t>(plan.lengths.size()) ||
         plan.padded_tokens <= 0 || plan.lane_tokens <= 0) {
         throw std::invalid_argument("packed image prefill plan does not match the prefix");
     }
@@ -1651,7 +1718,7 @@ void fill_packed_image_prefill_batch(
 
     int32_t source_offset = 0;
     for (int32_t stream = 0; stream < plan.streams; ++stream) {
-        const int32_t length = input_prefix.image_lengths[stream];
+        const int32_t length = plan.lengths[stream];
         for (int32_t token = 0; token < length; ++token) {
             batch.seq_id[source_offset + token][0] = stream;
         }
@@ -1713,6 +1780,9 @@ mtmd::context_ptr make_vision_context(
         llama_model * model,
         bool exact_tile,
         int32_t exact_tile_max_edge) {
+    const auto model_load_started = std::chrono::steady_clock::now();
+    const lladao::detail::d2f_process_resource_snapshot model_load_resources_started =
+            lladao::detail::snapshot_process_resources();
     mtmd_context_params mtmd_params = mtmd_context_params_default();
     mtmd_params.use_gpu = p.vision_gpu < 0 ? p.n_gpu_layers > 0 : p.vision_gpu != 0;
     mtmd_params.print_timings = p.print_timings;
@@ -1730,6 +1800,21 @@ mtmd::context_ptr make_vision_context(
     if (!mtmd_support_vision(context.get())) {
         throw std::runtime_error("mmproj does not support vision");
     }
+    const double model_load_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - model_load_started).count();
+    const lladao::d2f_phase_resource_usage model_load_resources =
+            lladao::detail::resource_usage_delta(
+                    model_load_resources_started,
+                    lladao::detail::snapshot_process_resources());
+    print_phase_resources(
+            "model_load", model_load_seconds, model_load_resources, "vision");
+    std::fprintf(
+            stderr,
+            "D2F model_load_config component=vision use_gpu=%s exact_tile=%s"
+            " exact_tile_max_edge=%" PRId32 "\n",
+            mtmd_params.use_gpu ? "true" : "false",
+            exact_tile ? "true" : "false",
+            exact_tile_max_edge);
     return context;
 }
 
@@ -2091,9 +2176,11 @@ struct d2f_engine::impl {
         if (p.prefix_prefill_mode != lladao::d2f_prefix_prefill_mode::exact && !p.prefix_cache) {
             throw std::invalid_argument("split prefix prefill modes require the prefix cache");
         }
-        if (p.prefix_prefill_mode == lladao::d2f_prefix_prefill_mode::component_parallel &&
+        if (lladao::detail::prefix_prefill_requires_flash_attention(p.prefix_prefill_mode) &&
             p.flash_attention_mode == lladao::d2f_flash_attention_mode::disabled) {
-            throw std::invalid_argument("component_parallel prefill requires Flash Attention");
+            throw std::invalid_argument(
+                    std::string(lladao::detail::prefix_prefill_mode_name(p.prefix_prefill_mode)) +
+                    " prefill requires Flash Attention");
         }
         if (p.vision_kv_compression &&
             p.prefix_prefill_mode != lladao::d2f_prefix_prefill_mode::component_parallel) {
@@ -2129,6 +2216,7 @@ struct d2f_engine::impl {
 
         base.model = p.model_path;
         base.mmproj = p.mmproj_path;
+        base.devices = p.devices;
         base.n_ctx = p.context_size;
         base.n_gpu_layers = p.gpu_layers;
         cpu_threads_requested = p.threads;
@@ -2158,14 +2246,44 @@ struct d2f_engine::impl {
         base.sparse_generation_logits = p.sparse_generation_logits;
         base.release_vision_after_encode = p.release_vision_after_encode;
         base.vision_kv_compression = p.vision_kv_compression;
+        base.use_mmap = p.use_mmap;
         base.print_timings = p.print_timings;
 
+        const auto model_load_started = std::chrono::steady_clock::now();
+        const lladao::detail::d2f_process_resource_snapshot model_load_resources_started =
+                lladao::detail::snapshot_process_resources();
         ggml_backend_load_all();
         backend = language_backend_name(base.n_gpu_layers);
 
         llama_model_params model_params = llama_model_default_params();
         model_params.n_gpu_layers = base.n_gpu_layers;
-        if (base.n_gpu_layers == 0) {
+        model_params.load_mode = base.use_mmap ? LLAMA_LOAD_MODE_MMAP : LLAMA_LOAD_MODE_NONE;
+        if (!base.devices.empty()) {
+            size_t begin = 0;
+            while (begin < base.devices.size()) {
+                const size_t end = base.devices.find_first_of(",/", begin);
+                std::string name = base.devices.substr(
+                        begin, end == std::string::npos ? std::string::npos : end - begin);
+                const size_t first = name.find_first_not_of(" \t");
+                const size_t last = name.find_last_not_of(" \t");
+                if (first == std::string::npos) {
+                    throw std::invalid_argument("empty device in --device list");
+                }
+                name = name.substr(first, last - first + 1);
+                ggml_backend_dev_t device = ggml_backend_dev_by_name(name.c_str());
+                if (!device || ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    throw std::invalid_argument("unknown non-CPU device: " + name);
+                }
+                language_devices.push_back(device);
+                if (end == std::string::npos) {
+                    break;
+                }
+                begin = end + 1;
+            }
+            language_devices.push_back(nullptr);
+            model_params.devices = language_devices.data();
+            backend = base.devices;
+        } else if (base.n_gpu_layers == 0) {
             language_devices.push_back(nullptr);
             model_params.devices = language_devices.data();
         }
@@ -2220,10 +2338,27 @@ struct d2f_engine::impl {
         if (!p.adapter_path.empty()) {
             set_adapter_locked(p.adapter_path, p.adapter_scale);
         }
+        const double model_load_seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - model_load_started).count();
+        const lladao::d2f_phase_resource_usage model_load_resources =
+                lladao::detail::resource_usage_delta(
+                        model_load_resources_started,
+                        lladao::detail::snapshot_process_resources());
+        print_phase_resources(
+                "model_load", model_load_seconds, model_load_resources, "language");
+        std::fprintf(
+                stderr,
+                "D2F model_load_config component=language gpu_layers=%" PRId32
+                " device_mode=%s adapter=%s backend=%s use_mmap=%s\n",
+                base.n_gpu_layers,
+                lladao::detail::language_device_mode(base.n_gpu_layers),
+                p.adapter_path.empty() ? "false" : "true",
+                backend.c_str(),
+                base.use_mmap ? "true" : "false");
         std::fprintf(
                 stderr,
                 "D2F cache_type_k=%s cache_type_v=%s flash_attn_requested=%s"
-                " prefix_prefill_mode=%s prefix_pack_size=%" PRId32
+                " prefix_prefill_mode=%s prefix_prefill_semantics=%s prefix_pack_size=%" PRId32
                 " generation_block_cache=%s sparse_generation_logits=%s"
                 " release_vision_after_encode=%s cpu_mask_requested=%s"
                 " cpu_threads_requested=%" PRId32 " cpu_threads_configured=%" PRId32
@@ -2233,6 +2368,7 @@ struct d2f_engine::impl {
                 ggml_type_name(base.cache_type_v),
                 flash_attention_mode_name(base.flash_attention_mode),
                 lladao::detail::prefix_prefill_mode_name(base.prefix_prefill_mode),
+                lladao::detail::prefix_prefill_semantics_name(base.prefix_prefill_mode),
                 base.prefix_pack_size,
                 base.generation_block_cache ? "true" : "false",
                 base.sparse_generation_logits ? "true" : "false",
@@ -2429,7 +2565,7 @@ struct d2f_engine::impl {
         context_params.type_k = base.cache_type_k;
         context_params.type_v = base.cache_type_v;
         const bool require_parallel_flash =
-                base.prefix_prefill_mode == lladao::d2f_prefix_prefill_mode::component_parallel;
+                lladao::detail::prefix_prefill_requires_flash_attention(base.prefix_prefill_mode);
         context_params.flash_attn_type = require_parallel_flash
                 ? LLAMA_FLASH_ATTN_TYPE_ENABLED
                 : to_llama_flash_attention_mode(base.flash_attention_mode);
@@ -2462,7 +2598,8 @@ struct d2f_engine::impl {
             llama_context_flash_attn_type(context.get()) != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
             context.reset();
             throw std::runtime_error(
-                    "component_parallel prefill did not resolve to Flash Attention");
+                    std::string(lladao::detail::prefix_prefill_mode_name(base.prefix_prefill_mode)) +
+                    " prefill did not resolve to Flash Attention");
         }
         ensure_cpu_threadpool();
         if (cpu_threadpool) {
@@ -2518,6 +2655,8 @@ struct d2f_engine::impl {
         result.flash_attention_mode = result.flash_attention_resolved;
         result.prefix_prefill_mode =
                 lladao::detail::prefix_prefill_mode_name(base.prefix_prefill_mode);
+        result.prefix_prefill_semantics =
+                lladao::detail::prefix_prefill_semantics_name(base.prefix_prefill_mode);
         result.backend = backend;
         result.prefix_pack_size = base.prefix_pack_size;
         result.vision_kv_compression = base.vision_kv_compression;
@@ -2658,6 +2797,8 @@ struct d2f_engine::impl {
         if (!prefix_cache && input_prefix == nullptr) {
             throw std::logic_error("full-sequence D2F decoding requires prefix embeddings");
         }
+        const lladao::detail::d2f_process_resource_snapshot decode_resources_started =
+                lladao::detail::snapshot_process_resources();
 
         activate_language_affinity();
         llama_set_d2f_attention(
@@ -2786,6 +2927,9 @@ struct d2f_engine::impl {
         const auto generation_finished = std::chrono::steady_clock::now();
         result.decode_seconds =
                 std::chrono::duration<double>(generation_finished - decode_started).count();
+        result.decode_resources = lladao::detail::resource_usage_delta(
+                decode_resources_started,
+                lladao::detail::snapshot_process_resources());
         result.generation_seconds =
                 std::chrono::duration<double>(generation_finished - generation_started).count();
         std::fprintf(
@@ -2804,6 +2948,7 @@ struct d2f_engine::impl {
                 result.d2f_reused_input_rows,
                 result.generation_block_cache ? "true" : "false",
                 result.sparse_generation_logits ? "true" : "false");
+        print_phase_resources("decode", result.decode_seconds, result.decode_resources);
         if (base.print_timings) {
             llama_perf_context_print(context.get());
         }
@@ -2865,6 +3010,9 @@ struct d2f_engine::impl {
 
         d2f_result result;
         set_cache_audit(result);
+        const auto vision_phase_started = std::chrono::steady_clock::now();
+        const lladao::detail::d2f_process_resource_snapshot vision_resources_started =
+                lladao::detail::snapshot_process_resources();
         std::vector<encoded_image> native_images;
         full_page_images page;
         std::vector<const encoded_image *> selected_images;
@@ -2873,6 +3021,8 @@ struct d2f_engine::impl {
         int32_t dense_image_length = 0;
         int32_t max_work_tokens = 0;
         std::vector<llama_token> retrieval_query_tokens;
+        uint64_t vision_embedding_copy_bytes = 0;
+        double vision_embedding_copy_seconds = 0.0;
 
         if (p.full_page_tiles) {
             native_vision.reset();
@@ -2882,6 +3032,14 @@ struct d2f_engine::impl {
                     std::chrono::steady_clock::now() - vision_started).count();
             if (page.sources.empty()) {
                 throw std::runtime_error("full-page tiling produced no source images");
+            }
+            for (const encoded_image & image : page.sources) {
+                vision_embedding_copy_bytes += image.embedding_copy_bytes;
+                vision_embedding_copy_seconds += image.embedding_copy_seconds;
+            }
+            if (page.overview) {
+                vision_embedding_copy_bytes += page.overview->embedding_copy_bytes;
+                vision_embedding_copy_seconds += page.overview->embedding_copy_seconds;
             }
             const std::string generation_prompt = full_page_generation_prompt(
                     operation,
@@ -2945,6 +3103,8 @@ struct d2f_engine::impl {
                         base.exact_image_max_edge);
                 result.vision_encode_seconds = std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - vision_started).count();
+                vision_embedding_copy_bytes = image.embedding_copy_bytes;
+                vision_embedding_copy_seconds = image.embedding_copy_seconds;
                 image.dense_position = 0;
                 if (request.image_cache_key.empty()) {
                     native_images.push_back(std::move(image));
@@ -2978,6 +3138,20 @@ struct d2f_engine::impl {
                     request.image_cache_key.empty() ? "none" : "content",
                     result.vision_encode_seconds);
         }
+
+        result.vision_embedding_copy_bytes = vision_embedding_copy_bytes;
+        result.vision_embedding_copy_seconds = vision_embedding_copy_seconds;
+        result.vision_phase_seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - vision_phase_started).count();
+        result.vision_resources = lladao::detail::resource_usage_delta(
+                vision_resources_started,
+                lladao::detail::snapshot_process_resources());
+        std::fprintf(
+                stderr,
+                "D2F vision_embedding_copy bytes=%" PRIu64 " seconds=%.6f\n",
+                result.vision_embedding_copy_bytes,
+                result.vision_embedding_copy_seconds);
+        print_phase_resources("vision", result.vision_phase_seconds, result.vision_resources);
 
         if (max_work_tokens > p.n_ctx) {
             throw std::runtime_error(
@@ -3118,6 +3292,10 @@ struct d2f_engine::impl {
             return result;
         }
 
+        const auto prefill_phase_started = std::chrono::steady_clock::now();
+        const lladao::detail::d2f_process_resource_snapshot prefill_resources_started =
+                lladao::detail::snapshot_process_resources();
+        const auto prefix_build_started = std::chrono::steady_clock::now();
         const prefix input_prefix = build_prefix(
                 *token_embeddings,
                 selected_images,
@@ -3126,6 +3304,11 @@ struct d2f_engine::impl {
                 vision_end,
                 prompt_position,
                 n_embd);
+        result.prefix_build_seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - prefix_build_started).count();
+        result.prefix_build_copy_bytes =
+                static_cast<uint64_t>(input_prefix.embeddings.size()) * sizeof(float) +
+                static_cast<uint64_t>(input_prefix.positions.size()) * sizeof(llama_pos);
         const int32_t max_tokens = input_prefix.total_length + D2F_GENERATION_LENGTH;
         if (max_tokens > p.n_ctx || max_tokens > max_work_tokens) {
             throw std::logic_error("selected prefix exceeds its validated capacity");
@@ -3139,11 +3322,18 @@ struct d2f_engine::impl {
                         prompt_length,
                         base.prefix_prefill_mode,
                         base.prefix_pack_size);
-        const bool use_packed_parallel =
-                base.prefix_prefill_mode == lladao::d2f_prefix_prefill_mode::component_parallel &&
-                input_prefix.image_lengths.size() > 1;
+        std::vector<int32_t> packed_lane_lengths;
+        if (base.prefix_prefill_mode == lladao::d2f_prefix_prefill_mode::component_parallel &&
+            input_prefix.image_lengths.size() > 1) {
+            packed_lane_lengths = input_prefix.image_lengths;
+        } else if (base.prefix_prefill_mode == lladao::d2f_prefix_prefill_mode::packed_parallel) {
+            packed_lane_lengths = lladao::detail::plan_packed_parallel_lanes(
+                    input_prefix.image_lengths,
+                    base.prefix_pack_size);
+        }
+        const bool use_packed_parallel = packed_lane_lengths.size() > 1;
         const packed_image_prefill_plan packed_plan = use_packed_parallel
-                ? make_packed_image_prefill_plan(input_prefix.image_lengths)
+                ? make_packed_image_prefill_plan(packed_lane_lengths)
                 : packed_image_prefill_plan {};
         const int32_t required_resident = max_work_tokens;
         int32_t required_ubatch = p.prefix_cache
@@ -3267,6 +3457,7 @@ struct d2f_engine::impl {
                     }
                     qk_capture->begin_phase(phase, submitted_tokens);
                 }
+                const auto batch_build_started = std::chrono::steady_clock::now();
                 if (packed_image_chunk) {
                     fill_packed_image_prefill_batch(
                             batch,
@@ -3281,6 +3472,11 @@ struct d2f_engine::impl {
                             chunk.length,
                             n_embd);
                 }
+                result.prefill_batch_build_seconds += std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - batch_build_started).count();
+                result.prefill_batch_copy_bytes +=
+                        static_cast<uint64_t>(submitted_tokens) *
+                        (static_cast<uint64_t>(n_embd) * sizeof(float) + sizeof(llama_pos));
                 const auto decode_chunk = [&]() {
                     const uint64_t parallel_activation_before = packed_image_chunk
                             ? llama_context_d2f_parallel_activation_count(context.get())
@@ -3299,6 +3495,7 @@ struct d2f_engine::impl {
                     }
                     return status;
                 };
+                const auto llama_decode_started = std::chrono::steady_clock::now();
                 const int32_t decode_result = packed_image_chunk
                         ? lladao::detail::with_packed_prefill_contract(
                                 [&]() {
@@ -3313,6 +3510,14 @@ struct d2f_engine::impl {
                                 },
                                 decode_chunk)
                         : decode_chunk();
+                if (decode_result == 0) {
+                    // Most accelerators enqueue work asynchronously. Synchronize
+                    // here so this field measures backend execution rather than
+                    // only submission overhead.
+                    llama_synchronize(context.get());
+                }
+                result.prefill_llama_decode_seconds += std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - llama_decode_started).count();
                 if (decode_result != 0) {
                     if (qk_capture) {
                         qk_capture->reset();
@@ -3321,6 +3526,13 @@ struct d2f_engine::impl {
                         const auto prefill_finished = std::chrono::steady_clock::now();
                         result.prefill_seconds = std::chrono::duration<double>(
                                 prefill_finished - prefill_started).count();
+                        result.prefill_phase_seconds = std::chrono::duration<double>(
+                                prefill_finished - prefill_phase_started).count();
+                        result.prefill_resources = lladao::detail::resource_usage_delta(
+                                prefill_resources_started,
+                                lladao::detail::snapshot_process_resources());
+                        print_phase_resources(
+                                "prefill", result.prefill_phase_seconds, result.prefill_resources);
                         result.generation_seconds = std::chrono::duration<double>(
                                 prefill_finished - generation_started).count();
                         result.cancelled = true;
@@ -3335,7 +3547,7 @@ struct d2f_engine::impl {
                     llama_memory_t memory = llama_get_memory(context.get());
                     int32_t image_offset = 0;
                     for (int32_t stream = 1; stream < packed_plan.streams; ++stream) {
-                        image_offset += input_prefix.image_lengths[stream - 1];
+                        image_offset += packed_plan.lengths[stream - 1];
                         const llama_pos image_position = input_prefix.positions[image_offset];
                         llama_memory_seq_cp(
                                 memory,
@@ -3359,7 +3571,6 @@ struct d2f_engine::impl {
                     qk_capture->finish_phase();
                 }
                 set_cache_audit(result);
-                llama_synchronize(context.get());
                 const double chunk_seconds = std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - chunk_started).count();
                 std::fprintf(
@@ -3386,6 +3597,27 @@ struct d2f_engine::impl {
             const auto prefill_finished = std::chrono::steady_clock::now();
             result.prefill_seconds =
                     std::chrono::duration<double>(prefill_finished - prefill_started).count();
+            result.prefill_phase_seconds = std::chrono::duration<double>(
+                    prefill_finished - prefill_phase_started).count();
+            result.prefill_resources = lladao::detail::resource_usage_delta(
+                    prefill_resources_started,
+                    lladao::detail::snapshot_process_resources());
+            std::fprintf(
+                    stderr,
+                    "D2F prefill_breakdown prefix_build_seconds=%.6f"
+                    " prefix_build_copy_bytes=%" PRIu64
+                    " batch_build_seconds=%.6f batch_copy_bytes=%" PRIu64
+                    " llama_decode_seconds=%.6f"
+                    " prefill_seconds=%.6f phase_seconds=%.6f\n",
+                    result.prefix_build_seconds,
+                    result.prefix_build_copy_bytes,
+                    result.prefill_batch_build_seconds,
+                    result.prefill_batch_copy_bytes,
+                    result.prefill_llama_decode_seconds,
+                    result.prefill_seconds,
+                    result.prefill_phase_seconds);
+            print_phase_resources(
+                    "prefill", result.prefill_phase_seconds, result.prefill_resources);
             result.batched_prefill =
                     parallel_audit.batched_submission &&
                     use_packed_parallel &&
@@ -3397,6 +3629,7 @@ struct d2f_engine::impl {
             std::fprintf(
                     stderr,
                     "D2F parallel_prefill batched_submission=%s parallel_effective=%s"
+                    " semantics=%s"
                     " domains=%" PRId32
                     " image_decode_calls=%" PRId32
                     " activation_delta=%" PRIu64
@@ -3407,6 +3640,7 @@ struct d2f_engine::impl {
                     " backend=%s\n",
                     result.batched_prefill ? "true" : "false",
                     result.parallel_effective ? "true" : "false",
+                    result.prefix_prefill_semantics.c_str(),
                     result.domains,
                     result.image_prefill_calls,
                     result.parallel_activation_count_delta,
@@ -3490,10 +3724,11 @@ struct d2f_engine::impl {
             }
             std::fprintf(
                     stderr,
-                    "D2F prefix_cache=enabled mode=%s pack_size=%" PRId32
+                    "D2F prefix_cache=enabled mode=%s semantics=%s pack_size=%" PRId32
                     " chunks=%zu image_spans=%" PRId32 " image_prefill_calls=%" PRId32
                     " cached_tokens=%" PRId32 " prefill_seconds=%.6f\n",
                     lladao::detail::prefix_prefill_mode_name(base.prefix_prefill_mode),
+                    lladao::detail::prefix_prefill_semantics_name(base.prefix_prefill_mode),
                     base.prefix_pack_size,
                     prefix_chunks.size(),
                     result.image_span_count,
@@ -3525,6 +3760,23 @@ struct d2f_engine::impl {
             }
         } else {
             std::fprintf(stderr, "D2F prefix_cache=disabled\n");
+            result.prefill_phase_seconds = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - prefill_phase_started).count();
+            result.prefill_resources = lladao::detail::resource_usage_delta(
+                    prefill_resources_started,
+                    lladao::detail::snapshot_process_resources());
+            std::fprintf(
+                    stderr,
+                    "D2F prefill_breakdown prefix_build_seconds=%.6f"
+                    " prefix_build_copy_bytes=%" PRIu64
+                    " batch_build_seconds=0.000000 batch_copy_bytes=0"
+                    " llama_decode_seconds=0.000000"
+                    " prefill_seconds=0.000000 phase_seconds=%.6f\n",
+                    result.prefix_build_seconds,
+                    result.prefix_build_copy_bytes,
+                    result.prefill_phase_seconds);
+            print_phase_resources(
+                    "prefill", result.prefill_phase_seconds, result.prefill_resources);
         }
         return decode_prefix_locked(
                 layout,
@@ -3678,6 +3930,22 @@ static d2f_request make_request(
     return request;
 }
 
+static json make_phase_resource_output(
+        double wall_seconds,
+        const d2f_phase_resource_usage & usage) {
+    return {
+        { "wall_seconds",            wall_seconds                    },
+        { "process_cpu_seconds",     usage.process_cpu_seconds       },
+        { "minor_page_faults",       usage.minor_page_faults         },
+        { "major_page_faults",       usage.major_page_faults         },
+        { "inblock",                 usage.block_input_operations    },
+        { "oublock",                 usage.block_output_operations   },
+        { "proc_io_available",       usage.proc_io_available         },
+        { "read_bytes",              usage.read_bytes                },
+        { "write_bytes",             usage.write_bytes               },
+    };
+}
+
 static json make_batch_output(
         const batch_input & input,
         size_t index,
@@ -3696,6 +3964,7 @@ static json make_batch_output(
         { "flash_attention_requested", result.flash_attention_requested },
         { "flash_attention_resolved",  result.flash_attention_resolved  },
         { "prefix_prefill_mode",    result.prefix_prefill_mode    },
+        { "prefix_prefill_semantics", result.prefix_prefill_semantics },
         { "backend",                 result.backend                 },
         { "parallel_effective",      result.parallel_effective      },
         { "batched_prefill",         result.batched_prefill         },
@@ -3742,9 +4011,24 @@ static json make_batch_output(
         { "d2f_logit_rows",        result.d2f_logit_rows        },
         { "d2f_reused_input_rows", result.d2f_reused_input_rows },
         { "prefill_seconds",       result.prefill_seconds       },
+        { "prefill_phase_seconds", result.prefill_phase_seconds },
+        { "prefix_build_seconds",  result.prefix_build_seconds  },
+        { "prefix_build_copy_bytes", result.prefix_build_copy_bytes },
+        { "prefill_batch_build_seconds", result.prefill_batch_build_seconds },
+        { "prefill_batch_copy_bytes", result.prefill_batch_copy_bytes },
+        { "prefill_llama_decode_seconds", result.prefill_llama_decode_seconds },
         { "state_io_seconds",      result.state_io_seconds      },
         { "decode_seconds",        result.decode_seconds        },
         { "vision_encode_seconds", result.vision_encode_seconds },
+        { "vision_phase_seconds", result.vision_phase_seconds },
+        { "vision_embedding_copy_seconds", result.vision_embedding_copy_seconds },
+        { "vision_embedding_copy_bytes", result.vision_embedding_copy_bytes },
+        { "vision_resources", make_phase_resource_output(
+                result.vision_phase_seconds, result.vision_resources) },
+        { "prefill_resources", make_phase_resource_output(
+                result.prefill_phase_seconds, result.prefill_resources) },
+        { "decode_resources", make_phase_resource_output(
+                result.decode_seconds, result.decode_resources) },
         { "kv_cache_compression_seconds", result.kv_cache_compression_seconds },
         { "generation_seconds",    result.generation_seconds    },
         { "vision_cache_hit",      result.vision_cache_hit      },
@@ -3792,6 +4076,8 @@ static int run_batch(
         result.flash_attention_mode = result.flash_attention_resolved;
         result.prefix_prefill_mode =
                 lladao::detail::prefix_prefill_mode_name(engine_params.prefix_prefill_mode);
+        result.prefix_prefill_semantics =
+                lladao::detail::prefix_prefill_semantics_name(engine_params.prefix_prefill_mode);
         result.backend = language_backend_name(engine_params.gpu_layers);
         result.prefix_pack_size = engine_params.prefix_pack_size;
         result.vision_kv_compression = engine_params.vision_kv_compression;
@@ -3855,6 +4141,7 @@ int cli_main(int argc, char ** argv) {
         engine_params.adapter_path = p.lora;
         engine_params.context_size = p.n_ctx;
         engine_params.gpu_layers = p.n_gpu_layers;
+        engine_params.devices = p.devices;
         engine_params.threads = p.n_threads;
         engine_params.cpu_mask = p.cpu_mask;
         engine_params.cpu_strict = p.cpu_strict;
@@ -3881,6 +4168,7 @@ int cli_main(int argc, char ** argv) {
         engine_params.sparse_generation_logits = p.sparse_generation_logits;
         engine_params.release_vision_after_encode = p.release_vision_after_encode;
         engine_params.vision_kv_compression = p.vision_kv_compression;
+        engine_params.use_mmap = p.use_mmap;
         engine_params.print_timings = p.print_timings;
 
         if (!p.input_jsonl.empty()) {

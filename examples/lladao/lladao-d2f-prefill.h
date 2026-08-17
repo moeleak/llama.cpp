@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -83,6 +84,18 @@ inline const char * prefix_prefill_mode_name(d2f_prefix_prefill_mode mode) {
         case d2f_prefix_prefill_mode::component_exact: return "component_exact";
         case d2f_prefix_prefill_mode::packed_image:    return "packed_image";
         case d2f_prefix_prefill_mode::component_parallel: return "component_parallel";
+        case d2f_prefix_prefill_mode::packed_parallel: return "packed_parallel";
+    }
+    return "invalid";
+}
+
+inline const char * prefix_prefill_semantics_name(d2f_prefix_prefill_mode mode) {
+    switch (mode) {
+        case d2f_prefix_prefill_mode::exact:              return "exact";
+        case d2f_prefix_prefill_mode::component_exact:    return "exact_components";
+        case d2f_prefix_prefill_mode::component_parallel: return "exact_component_local";
+        case d2f_prefix_prefill_mode::packed_image:       return "approximate_sequential_chunks";
+        case d2f_prefix_prefill_mode::packed_parallel:    return "approximate_cross_chunk_isolated";
     }
     return "invalid";
 }
@@ -91,7 +104,30 @@ inline bool prefix_prefill_mode_valid(d2f_prefix_prefill_mode mode) {
     return mode == d2f_prefix_prefill_mode::exact ||
            mode == d2f_prefix_prefill_mode::component_exact ||
            mode == d2f_prefix_prefill_mode::packed_image ||
-           mode == d2f_prefix_prefill_mode::component_parallel;
+           mode == d2f_prefix_prefill_mode::component_parallel ||
+           mode == d2f_prefix_prefill_mode::packed_parallel;
+}
+
+inline bool prefix_prefill_requires_flash_attention(d2f_prefix_prefill_mode mode) {
+    return mode == d2f_prefix_prefill_mode::component_parallel ||
+           mode == d2f_prefix_prefill_mode::packed_parallel;
+}
+
+inline std::vector<int32_t> plan_packed_parallel_lanes(
+        const std::vector<int32_t> & image_lengths,
+        int32_t pack_size) {
+    if (image_lengths.size() != 1 || image_lengths.front() <= 0 || pack_size <= 0) {
+        throw std::invalid_argument("packed_parallel requires one non-empty image span and a positive pack size");
+    }
+
+    std::vector<int32_t> lanes;
+    int32_t remaining = image_lengths.front();
+    while (remaining > 0) {
+        const int32_t length = std::min(pack_size, remaining);
+        lanes.push_back(length);
+        remaining -= length;
+    }
+    return lanes;
 }
 
 inline std::vector<prefix_chunk> plan_prefix_chunks(
@@ -119,7 +155,11 @@ inline std::vector<prefix_chunk> plan_prefix_chunks(
     }
 
     const int32_t image_length = static_cast<int32_t>(total_length - prompt_length);
-    if (mode == d2f_prefix_prefill_mode::component_parallel) {
+    if (mode == d2f_prefix_prefill_mode::component_parallel ||
+        mode == d2f_prefix_prefill_mode::packed_parallel) {
+        if (mode == d2f_prefix_prefill_mode::packed_parallel) {
+            (void) plan_packed_parallel_lanes(image_lengths, pack_size);
+        }
         return {
             { 0, image_length, prefix_chunk_kind::image, -1 },
             { image_length, prompt_length, prefix_chunk_kind::prompt, -1 },
@@ -155,11 +195,16 @@ inline prefix_parallel_audit audit_prefix_parallelism(
         throw std::invalid_argument("parallel prefix audit requires at least one image span");
     }
 
+    const std::vector<int32_t> attention_domains =
+            mode == d2f_prefix_prefill_mode::packed_parallel
+                    ? plan_packed_parallel_lanes(image_lengths, pack_size)
+                    : image_lengths;
+
     prefix_parallel_audit result;
-    result.cu_seqlens.reserve(image_lengths.size() + 1);
+    result.cu_seqlens.reserve(attention_domains.size() + 1);
     result.cu_seqlens.push_back(0);
     int64_t total_length = 0;
-    for (int32_t image_length : image_lengths) {
+    for (int32_t image_length : attention_domains) {
         if (image_length <= 0) {
             throw std::invalid_argument("image prefix spans must not be empty");
         }
@@ -171,7 +216,7 @@ inline prefix_parallel_audit audit_prefix_parallelism(
         result.attention_pairs_packed += static_cast<int64_t>(image_length) * image_length;
     }
     result.attention_pairs_dense = total_length * total_length;
-    result.domains = static_cast<int32_t>(image_lengths.size());
+    result.domains = static_cast<int32_t>(attention_domains.size());
     result.flash_attention_resolved = flash_attention_resolved;
 
     const std::vector<prefix_chunk> chunks = plan_prefix_chunks(image_lengths, 1, mode, pack_size);
@@ -182,7 +227,7 @@ inline prefix_parallel_audit audit_prefix_parallelism(
                 return chunk.kind == prefix_chunk_kind::image;
             }));
     result.batched_submission =
-            mode == d2f_prefix_prefill_mode::component_parallel &&
+            prefix_prefill_requires_flash_attention(mode) &&
             result.domains > 1 &&
             result.image_decode_calls == 1;
     return result;
@@ -191,8 +236,10 @@ inline prefix_parallel_audit audit_prefix_parallelism(
 inline void validate_prefix_parallel_backend(
         d2f_prefix_prefill_mode mode,
         bool flash_attention_resolved) {
-    if (mode == d2f_prefix_prefill_mode::component_parallel && !flash_attention_resolved) {
-        throw std::invalid_argument("component_parallel prefill requires resolved Flash Attention");
+    if (prefix_prefill_requires_flash_attention(mode) && !flash_attention_resolved) {
+        throw std::invalid_argument(
+                std::string(prefix_prefill_mode_name(mode)) +
+                " prefill requires resolved Flash Attention");
     }
 }
 

@@ -712,6 +712,145 @@ static double test_d2f_prefix_cache(llama_model * model, const std::vector<llama
         }
     }
 
+    const auto run_single_image_packed_parallel = [&](bool packed) {
+        static constexpr int32_t lane_count = 3;
+        static constexpr int32_t lane_size = 2;
+
+        llama_context_params params = llama_context_default_params();
+        params.n_ctx = 16;
+        params.n_batch = image_prefix_length;
+        params.n_ubatch = image_prefix_length;
+        params.n_outputs_max = generation_length;
+        params.n_seq_max = lane_count;
+        params.kv_unified = true;
+        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        params.no_perf = true;
+        llama_context_ptr context(llama_init_from_model(model, params));
+        if (!context) {
+            throw std::runtime_error("failed to create single-image packed_parallel context");
+        }
+        llama_set_causal_attn(context.get(), false);
+        llama_set_d2f_attention(
+                context.get(),
+                image_prefix_length,
+                prefix_length,
+                prompt_position,
+                generation_position,
+                block_size);
+        if (packed) {
+            llama_set_d2f_packed_prefill(
+                    context.get(),
+                    lane_count,
+                    image_prefix_length,
+                    lane_size);
+        }
+
+        const int32_t image_decodes = packed ? 1 : lane_count;
+        for (int32_t decode_index = 0; decode_index < image_decodes; ++decode_index) {
+            const int32_t offset = packed ? 0 : decode_index*lane_size;
+            const int32_t length = packed ? image_prefix_length : lane_size;
+            llama_batch image = llama_batch_init(length, packed_test_n_embd, 1);
+            image.n_tokens = length;
+            for (int32_t i = 0; i < length; ++i) {
+                const int32_t source = offset + i;
+                std::copy_n(
+                        packed_test_image_embeddings.data() +
+                                static_cast<size_t>(source)*packed_test_n_embd,
+                        packed_test_n_embd,
+                        image.embd + static_cast<size_t>(i)*packed_test_n_embd);
+                image.pos[i] = packed_test_positions[source];
+                image.n_seq_id[i] = 1;
+                image.seq_id[i][0] = packed ? source/lane_size : decode_index;
+                image.logits[i] = i == length - 1;
+            }
+            if (llama_decode(context.get(), image) != 0) {
+                llama_batch_free(image);
+                throw std::runtime_error("single-image packed_parallel image decode failed");
+            }
+            llama_batch_free(image);
+        }
+
+        if (packed) {
+            llama_set_d2f_packed_prefill(context.get(), 0, 0, 0);
+        }
+        for (int32_t lane = 1; lane < lane_count; ++lane) {
+            const int32_t offset = lane*lane_size;
+            const auto first = packed_test_positions.begin() + offset;
+            const auto last = first + lane_size;
+            const llama_pos position_min = *std::min_element(first, last);
+            const llama_pos position_max = *std::max_element(first, last);
+            llama_memory_seq_cp(
+                    llama_get_memory(context.get()),
+                    lane,
+                    0,
+                    position_min,
+                    position_max + 1);
+            if (!llama_memory_seq_rm(
+                        llama_get_memory(context.get()),
+                        lane,
+                        position_min,
+                        position_max + 1)) {
+                throw std::runtime_error("single-image packed_parallel lane merge failed");
+            }
+        }
+
+        const int32_t prompt_length = prefix_length - image_prefix_length;
+        llama_batch prompt = llama_batch_init(prompt_length, 0, 1);
+        for (int32_t i = 0; i < prompt_length; ++i) {
+            const int32_t source = image_prefix_length + i;
+            common_batch_add(prompt, tokens[source], positions[source], { 0 }, i == prompt_length - 1);
+        }
+        if (llama_decode(context.get(), prompt) != 0) {
+            llama_batch_free(prompt);
+            throw std::runtime_error("single-image packed_parallel prompt decode failed");
+        }
+        llama_batch_free(prompt);
+
+        llama_batch generation = llama_batch_init(generation_length, 0, 1);
+        for (int32_t i = 0; i < generation_length; ++i) {
+            const int32_t source = prefix_length + i;
+            common_batch_add(generation, tokens[source], positions[source], { 0 }, true);
+        }
+        if (llama_decode(context.get(), generation) != 0) {
+            llama_batch_free(generation);
+            throw std::runtime_error("single-image packed_parallel generation decode failed");
+        }
+        std::vector<float> result;
+        result.reserve((generation_length + 1)*n_vocab);
+        for (int32_t i = 0; i < generation_length; ++i) {
+            const float * row = llama_get_logits_ith(context.get(), i);
+            result.insert(result.end(), row, row + n_vocab);
+        }
+        llama_batch_free(generation);
+
+        llama_batch continuation = llama_batch_init(1, 0, 1);
+        common_batch_add(continuation, tokens[0], generation_position + generation_length, { 0 }, true);
+        if (llama_decode(context.get(), continuation) != 0) {
+            llama_batch_free(continuation);
+            throw std::runtime_error("single-image packed_parallel continuation decode failed");
+        }
+        const float * continuation_logits = llama_get_logits_ith(context.get(), 0);
+        result.insert(result.end(), continuation_logits, continuation_logits + n_vocab);
+        llama_batch_free(continuation);
+        return result;
+    };
+
+    const std::vector<float> logits_packed_parallel_reference =
+            run_single_image_packed_parallel(false);
+    const std::vector<float> logits_packed_parallel =
+            run_single_image_packed_parallel(true);
+    for (int32_t i = 0; i < generation_length + 1; ++i) {
+        const auto reference_begin =
+                logits_packed_parallel_reference.begin() + static_cast<size_t>(i)*n_vocab;
+        const auto packed_begin = logits_packed_parallel.begin() + static_cast<size_t>(i)*n_vocab;
+        if (std::max_element(reference_begin, reference_begin + n_vocab) - reference_begin !=
+            std::max_element(packed_begin, packed_begin + n_vocab) - packed_begin) {
+            throw std::runtime_error("single-image packed_parallel continuation token mismatch");
+        }
+    }
+    const double packed_parallel_nmse =
+            nmse(logits_packed_parallel_reference, logits_packed_parallel);
+
     const auto run_quantized_packed_arm = [&](bool packed) {
         static constexpr int32_t packed_tokens = image_prefix_length;
 
@@ -1124,11 +1263,12 @@ static double test_d2f_prefix_cache(llama_model * model, const std::vector<llama
     std::fprintf(
             stderr,
             "D2F prefix equivalence: full_cache_nmse=%.9e component_parallel_nmse=%.9e "
-            "packed_lanes_nmse=%.9e packed_q8_nmse=%.9e scheduler_nmse=%.9e "
+            "packed_lanes_nmse=%.9e packed_parallel_nmse=%.9e packed_q8_nmse=%.9e scheduler_nmse=%.9e "
             "transferred_nmse=%.9e output_tokens=match\n",
             full_cache_nmse,
             component_parallel_nmse,
             packed_lanes_nmse,
+            packed_parallel_nmse,
             packed_q8_nmse,
             scheduler_nmse,
             transferred_nmse);
@@ -1136,6 +1276,7 @@ static double test_d2f_prefix_cache(llama_model * model, const std::vector<llama
             full_cache_nmse,
             component_parallel_nmse,
             packed_lanes_nmse,
+            packed_parallel_nmse,
             packed_q8_nmse,
             transferred_nmse,
             scheduler_nmse,

@@ -74,7 +74,7 @@ These additions change the C++ layouts of `d2f_engine_params` and `d2f_result`.
 JNI, static-library, and shared-library users must cleanly reconfigure and
 rebuild all dependents; do not combine a new header with an old library.
 
-Prefix prefill has four explicit modes:
+Prefix prefill has five explicit modes:
 
 - `--prefix-prefill-mode exact` is the default and submits the complete image
   plus prompt prefix as one batch with native D2F visibility: image tokens are
@@ -105,6 +105,16 @@ Prefix prefill has four explicit modes:
   spans into bounded chunks and still submits the complete prompt at once. It
   changes image-token visibility across chunk boundaries, so it is an opt-in
   performance/quality ablation rather than the default.
+- `--prefix-prefill-mode packed_parallel --prefix-pack-size 512` accepts one
+  image span, splits it into local bidirectional lanes, submits all real image
+  tokens in one packed graph, and then submits the complete prompt. Lanes
+  cannot attend across chunk boundaries, so this is explicitly approximate
+  and reports `prefix_prefill_semantics=approximate_cross_chunk_isolated`.
+  Resident token count and KV storage remain unchanged because no padding KV
+  entries are allocated. This mode requires resolved Flash Attention. It also
+  works with the CPU or a single Vulkan compute queue; in those cases the
+  packed graph is used but `parallel_effective` remains false unless a backend
+  reports a validated parallel activation.
 
 The modified Python GUI runtime's normal `_forward_image_spans()` generation
 path loops over image spans sequentially; `component_exact` matches that path.
@@ -117,8 +127,8 @@ graph branches. The separate FastDLLM
 text-chunk algorithm.
 
 Every chunk boundary, token range, component index, and elapsed time is logged.
-`component_parallel` reports `batched_prefill`, `domains`, the actual number of
-image decode calls, `attention_pairs_dense`, `attention_pairs_packed`,
+The packed parallel modes report `batched_prefill`, `domains`, the actual
+number of image decode calls, `attention_pairs_dense`, `attention_pairs_packed`,
 `attention_pairs_executed`, and the selected backend. The executed-pair count
 is marked known only for the exact ragged branches. `batched_prefill=true`
 means one image-only `llama_decode()` submitted all domains; it does not claim
@@ -138,6 +148,20 @@ the non-split Flash Attention path so they never share split-K scratch storage;
 ordinary Vulkan attention is unchanged. The Android quality, stability, and
 latency gate must compare the same samples against `component_exact` before an
 application opts a device into multi-queue execution.
+
+For a native-resized single screenshot, enable the approximate packed path
+with:
+
+```sh
+llama-lladao-d2f \
+  --model /path/to/lladao-language.gguf \
+  --mmproj /path/to/lladao-mmproj.gguf \
+  --image /path/to/screenshot.png \
+  --prompt 'Click on Settings.' \
+  --prefix-prefill-mode packed_parallel \
+  --prefix-pack-size 512 \
+  --flash-attn enabled
+```
 
 A fixed three-span A800 diagnostic used the same Q3_K_L language model, Q8_0
 vision projector, screenshot, prompt, 16K context, F16 KV cache, Flash

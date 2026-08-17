@@ -42,6 +42,11 @@ if (LLAMA_BUILD_TESTS)
     target_compile_features(${TEST_TARGET} PRIVATE cxx_std_17)
     add_test(NAME ${TEST_TARGET} COMMAND ${TEST_TARGET})
 
+    set(TEST_TARGET test-lladao-d2f-phase-io)
+    add_executable(${TEST_TARGET} test-d2f-phase-io.cpp)
+    target_compile_features(${TEST_TARGET} PRIVATE cxx_std_17)
+    add_test(NAME ${TEST_TARGET} COMMAND ${TEST_TARGET})
+
     set(TEST_TARGET test-lladao-d2f-vulkan-parser)
     add_executable(${TEST_TARGET} test-d2f-vulkan-parser.cpp)
     target_include_directories(${TEST_TARGET} PRIVATE ../../ggml/src ../../ggml/src/ggml-vulkan)
